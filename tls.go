@@ -19,6 +19,7 @@ import (
 	"crypto/cipher"
 	"crypto/ecdsa"
 	"crypto/ed25519"
+	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/x509"
@@ -26,6 +27,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"github.com/patrickmn/go-cache"
 	"io"
 	"net"
 	"os"
@@ -46,22 +48,12 @@ type CloseWriteConn interface {
 }
 
 type MirrorConn struct {
-	*sync.Mutex
 	net.Conn
-	Target net.Conn
 }
 
 func (c *MirrorConn) Read(b []byte) (int, error) {
-	c.Unlock()
 	runtime.Gosched()
 	n, err := c.Conn.Read(b)
-	c.Lock() // calling c.Lock() before c.Target.Write(), to make sure that this goroutine has the priority to make the next move
-	if n != 0 {
-		c.Target.Write(b[:n])
-	}
-	if err != nil {
-		c.Target.Close()
-	}
 	return n, err
 }
 
@@ -106,6 +98,174 @@ func Value(vals ...byte) (value int) {
 	return
 }
 
+var (
+	serverHelloCache    = cache.New(5*time.Minute, 10*time.Minute)
+	serverHelloMakeLock = new(sync.Mutex)
+)
+
+func serverHelloInCache(chm *clientHelloMsg) (*serverHelloMsg, bool) {
+	msg, ok := serverHelloCache.Get(chm.serverName)
+	if !ok {
+		return nil, false
+	}
+	res, ok := msg.(*serverHelloMsg)
+	if !ok {
+		return nil, false
+	}
+	res.raw = nil
+	res.sessionId = chm.sessionId
+	res.random = make([]byte, 32)
+	rand.Read(res.random)
+	for _, cipherSuite := range chm.cipherSuites {
+		if cipherSuiteTLS13ByID(cipherSuite) != nil {
+			res.cipherSuite = cipherSuite
+		}
+	}
+	return res, ok
+}
+
+func makeServerHello(ctx context.Context, config *Config, msg *clientHelloMsg) (net.Conn, *serverHelloMsg, error) {
+	if shMsg, ok := serverHelloInCache(msg); ok {
+		return nil, shMsg, nil
+	}
+	serverHelloMakeLock.Lock()
+	defer serverHelloMakeLock.Unlock()
+	if shMsg, ok := serverHelloInCache(msg); ok {
+		shMsg.raw = nil
+		return nil, shMsg, nil
+	}
+	target, err := config.DialContext(ctx, config.Type, fmt.Sprintf("%s:443", msg.serverName))
+	if err != nil {
+		return nil, nil, errors.New("REALITY: failed to dial serverName: " + err.Error())
+	}
+	data, err := msg.marshal()
+	if err != nil {
+		return target, nil, errors.New("REALITY: failed to marshal client hello msg: " + err.Error())
+	}
+	var outData = make([]byte, recordHeaderLen)
+	vers := msg.vers
+	if vers == 0 {
+		// Some TLS servers fail if the record version is
+		// greater than TLS 1.0 for the initial ClientHello.
+		vers = VersionTLS10
+	} else if vers == VersionTLS13 {
+		// TLS 1.3 froze the record layer version to 1.2.
+		// See RFC 8446, Section 5.1.
+		vers = VersionTLS12
+	}
+	outData[0] = byte(recordTypeHandshake)
+	outData[1] = byte(vers >> 8)
+	outData[2] = byte(vers)
+	outData[3] = byte(len(data) >> 8)
+	outData[4] = byte(len(data))
+	target.Write(append(outData, data...))
+	buf := make([]byte, size)
+	s2cSaved := make([]byte, 0, size)
+	handshakeLen := 0
+	hello := new(serverHelloMsg)
+	var outHandshakeLen [7]int
+f:
+	for {
+		n, err := target.Read(buf)
+		if n == 0 {
+			if err != nil {
+				return target, nil, errors.New("REALITY: failed to target read: " + err.Error())
+			}
+			continue
+		}
+		s2cSaved = append(s2cSaved, buf[:n]...)
+		if len(s2cSaved) > size {
+			return target, nil, errors.New("target read server hello fail")
+		}
+		for i, t := range types {
+			if outHandshakeLen[i] != 0 {
+				continue
+			}
+			if i == 6 && len(s2cSaved) == 0 {
+				break
+			}
+			if handshakeLen == 0 && len(s2cSaved) > recordHeaderLen {
+				if Value(s2cSaved[1:3]...) != VersionTLS12 ||
+					(i == 0 && (recordType(s2cSaved[0]) != recordTypeHandshake || s2cSaved[5] != typeServerHello)) ||
+					(i == 1 && (recordType(s2cSaved[0]) != recordTypeChangeCipherSpec || s2cSaved[5] != 1)) ||
+					(i > 1 && recordType(s2cSaved[0]) != recordTypeApplicationData) {
+					break f
+				}
+				handshakeLen = recordHeaderLen + Value(s2cSaved[3:5]...)
+			}
+			if config.Show {
+				fmt.Printf("REALITY len(s2cSaved): %v\t%v: %v\n", len(s2cSaved), t, handshakeLen)
+			}
+			if handshakeLen > size { // too long
+				break f
+			}
+			if i == 1 && handshakeLen > 0 && handshakeLen != 6 {
+				break f
+			}
+			if i == 2 && handshakeLen > 512 {
+				outHandshakeLen[i] = handshakeLen
+				break
+			}
+			if i == 6 && handshakeLen > 0 {
+				outHandshakeLen[i] = handshakeLen
+				break
+			}
+			if handshakeLen == 0 || len(s2cSaved) < handshakeLen {
+				continue f
+			}
+			if i == 0 {
+				if !hello.unmarshal(s2cSaved[recordHeaderLen:handshakeLen]) ||
+					hello.vers != VersionTLS12 || hello.supportedVersion != VersionTLS13 ||
+					cipherSuiteTLS13ByID(hello.cipherSuite) == nil ||
+					hello.serverShare.group != X25519 || len(hello.serverShare.data) != 32 {
+					break f
+				}
+			}
+			outHandshakeLen[i] = handshakeLen
+			s2cSaved = s2cSaved[handshakeLen:]
+			handshakeLen = 0
+		}
+		break
+	}
+	if outHandshakeLen[0] == 0 {
+		return target, nil, errors.New("target read server hello fail")
+	}
+	serverHelloCache.Set(msg.serverName, hello, config.CacheDuration)
+	return target, hello, nil
+}
+
+func serverFailHandler(ctx context.Context, conn CloseWriteConn, config *Config, msg *clientHelloMsg) error {
+	if msg == nil {
+		conn.Close()
+		return errors.New("REALITY: client hello msg is nil")
+	}
+	target, err := config.DialContext(ctx, config.Type, config.Dest)
+	if err != nil {
+		conn.Close()
+		return errors.New("REALITY: failed to dial dest: " + err.Error())
+	}
+	data, err := msg.marshal()
+	if err != nil {
+		conn.Close()
+		return errors.New("REALITY: failed to marshal client hello msg: " + err.Error())
+	}
+	target.Write(data)
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		io.Copy(target, conn)
+		wg.Done()
+	}()
+	go func() {
+		io.Copy(conn, target)
+		wg.Done()
+	}()
+	wg.Wait()
+	target.Close()
+	conn.Close()
+	return errors.New("REALITY: processed invalid connection")
+}
+
 // Server returns a new TLS server side connection
 // using conn as the underlying transport.
 // The configuration config must be non-nil and must include
@@ -116,257 +276,122 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 		fmt.Printf("REALITY remoteAddr: %v\n", remoteAddr)
 	}
 
-	target, err := config.DialContext(ctx, config.Type, config.Dest)
-	if err != nil {
-		conn.Close()
-		return nil, errors.New("REALITY: failed to dial dest: " + err.Error())
-	}
-
-	if config.Xver == 1 || config.Xver == 2 {
-		if _, err = proxyproto.HeaderProxyFromAddrs(config.Xver, conn.RemoteAddr(), conn.LocalAddr()).WriteTo(target); err != nil {
-			target.Close()
-			conn.Close()
-			return nil, errors.New("REALITY: failed to send PROXY protocol: " + err.Error())
-		}
-	}
-
-	raw := conn
+	var (
+		err error
+		raw = conn
+	)
 	if pc, ok := conn.(*proxyproto.Conn); ok {
 		raw = pc.Raw() // for TCP splicing in io.Copy()
 	}
 	underlying := raw.(CloseWriteConn) // *net.TCPConn or *net.UnixConn
 
-	mutex := new(sync.Mutex)
-
 	hs := serverHandshakeStateTLS13{
 		c: &Conn{
 			conn: &MirrorConn{
-				Mutex:  mutex,
-				Conn:   conn,
-				Target: target,
+				Conn: conn,
 			},
 			config: config,
 		},
 		ctx: context.Background(),
 	}
 
-	copying := false
-
-	waitGroup := new(sync.WaitGroup)
-	waitGroup.Add(2)
-
-	go func() {
-		for {
-			mutex.Lock()
-			hs.clientHello, err = hs.c.readClientHello(context.Background()) // TODO: Change some rules in this function.
-			if copying || err != nil || hs.c.vers != VersionTLS13 || !config.ServerNames[hs.clientHello.serverName] {
-				break
-			}
-			for i, keyShare := range hs.clientHello.keyShares {
-				if keyShare.group != X25519 || len(keyShare.data) != 32 {
-					continue
-				}
-				if hs.c.AuthKey, err = curve25519.X25519(config.PrivateKey, keyShare.data); err != nil {
-					break
-				}
-				if _, err = hkdf.New(sha256.New, hs.c.AuthKey, hs.clientHello.random[:20], []byte("REALITY")).Read(hs.c.AuthKey); err != nil {
-					break
-				}
-				var aead cipher.AEAD
-				if aesgcmPreferred(hs.clientHello.cipherSuites) {
-					block, _ := aes.NewCipher(hs.c.AuthKey)
-					aead, _ = cipher.NewGCM(block)
-				} else {
-					aead, _ = chacha20poly1305.New(hs.c.AuthKey)
-				}
-				if config.Show {
-					fmt.Printf("REALITY remoteAddr: %v\ths.c.AuthKey[:16]: %v\tAEAD: %T\n", remoteAddr, hs.c.AuthKey[:16], aead)
-				}
-				ciphertext := make([]byte, 32)
-				plainText := make([]byte, 32)
-				copy(ciphertext, hs.clientHello.sessionId)
-				copy(hs.clientHello.sessionId, plainText) // hs.clientHello.sessionId points to hs.clientHello.raw[39:]
-				if _, err = aead.Open(plainText[:0], hs.clientHello.random[20:], ciphertext, hs.clientHello.raw); err != nil {
-					break
-				}
-				copy(hs.clientHello.sessionId, ciphertext)
-				copy(hs.c.ClientVer[:], plainText)
-				hs.c.ClientTime = time.Unix(int64(binary.BigEndian.Uint32(plainText[4:])), 0)
-				copy(hs.c.ClientShortId[:], plainText[8:])
-				if config.Show {
-					fmt.Printf("REALITY remoteAddr: %v\ths.c.ClientVer: %v\n", remoteAddr, hs.c.ClientVer)
-					fmt.Printf("REALITY remoteAddr: %v\ths.c.ClientTime: %v\n", remoteAddr, hs.c.ClientTime)
-					fmt.Printf("REALITY remoteAddr: %v\ths.c.ClientShortId: %v\n", remoteAddr, hs.c.ClientShortId)
-				}
-				if (config.MinClientVer == nil || Value(hs.c.ClientVer[:]...) >= Value(config.MinClientVer...)) &&
-					(config.MaxClientVer == nil || Value(hs.c.ClientVer[:]...) <= Value(config.MaxClientVer...)) &&
-					(config.MaxTimeDiff == 0 || time.Since(hs.c.ClientTime).Abs() <= config.MaxTimeDiff) &&
-					(config.ShortIds[hs.c.ClientShortId]) {
-					hs.c.conn = conn
-				}
-				hs.clientHello.keyShares[0].group = CurveID(i)
-				break
-			}
-			if config.Show {
-				fmt.Printf("REALITY remoteAddr: %v\ths.c.conn == conn: %v\n", remoteAddr, hs.c.conn == conn)
-			}
+	hs.clientHello, err = hs.c.readClientHello(context.Background()) // TODO: Change some rules in this function.
+	if err != nil || hs.c.vers != VersionTLS13 || !config.isInServerNames(hs.clientHello.serverName) {
+		return nil, serverFailHandler(ctx, underlying, config, hs.clientHello)
+	}
+	for i, keyShare := range hs.clientHello.keyShares {
+		if keyShare.group != X25519 || len(keyShare.data) != 32 {
+			continue
+		}
+		if hs.c.AuthKey, err = curve25519.X25519(config.PrivateKey, keyShare.data); err != nil {
 			break
 		}
-		mutex.Unlock()
-		if hs.c.conn != conn {
-			if config.Show && hs.clientHello != nil {
-				fmt.Printf("REALITY remoteAddr: %v\tforwarded SNI: %v\n", remoteAddr, hs.clientHello.serverName)
-			}
-			io.Copy(target, underlying)
-		}
-		waitGroup.Done()
-	}()
-
-	go func() {
-		s2cSaved := make([]byte, 0, size)
-		buf := make([]byte, size)
-		handshakeLen := 0
-	f:
-		for {
-			runtime.Gosched()
-			n, err := target.Read(buf)
-			if n == 0 {
-				if err != nil {
-					conn.Close()
-					waitGroup.Done()
-					return
-				}
-				continue
-			}
-			mutex.Lock()
-			s2cSaved = append(s2cSaved, buf[:n]...)
-			if hs.c.conn != conn {
-				copying = true // if the target already sent some data, just start bidirectional direct forwarding
-				break
-			}
-			if len(s2cSaved) > size {
-				break
-			}
-			for i, t := range types {
-				if hs.c.out.handshakeLen[i] != 0 {
-					continue
-				}
-				if i == 6 && len(s2cSaved) == 0 {
-					break
-				}
-				if handshakeLen == 0 && len(s2cSaved) > recordHeaderLen {
-					if Value(s2cSaved[1:3]...) != VersionTLS12 ||
-						(i == 0 && (recordType(s2cSaved[0]) != recordTypeHandshake || s2cSaved[5] != typeServerHello)) ||
-						(i == 1 && (recordType(s2cSaved[0]) != recordTypeChangeCipherSpec || s2cSaved[5] != 1)) ||
-						(i > 1 && recordType(s2cSaved[0]) != recordTypeApplicationData) {
-						break f
-					}
-					handshakeLen = recordHeaderLen + Value(s2cSaved[3:5]...)
-				}
-				if config.Show {
-					fmt.Printf("REALITY remoteAddr: %v\tlen(s2cSaved): %v\t%v: %v\n", remoteAddr, len(s2cSaved), t, handshakeLen)
-				}
-				if handshakeLen > size { // too long
-					break f
-				}
-				if i == 1 && handshakeLen > 0 && handshakeLen != 6 {
-					break f
-				}
-				if i == 2 && handshakeLen > 512 {
-					hs.c.out.handshakeLen[i] = handshakeLen
-					hs.c.out.handshakeBuf = buf[:0]
-					break
-				}
-				if i == 6 && handshakeLen > 0 {
-					hs.c.out.handshakeLen[i] = handshakeLen
-					break
-				}
-				if handshakeLen == 0 || len(s2cSaved) < handshakeLen {
-					mutex.Unlock()
-					continue f
-				}
-				if i == 0 {
-					hs.hello = new(serverHelloMsg)
-					if !hs.hello.unmarshal(s2cSaved[recordHeaderLen:handshakeLen]) ||
-						hs.hello.vers != VersionTLS12 || hs.hello.supportedVersion != VersionTLS13 ||
-						cipherSuiteTLS13ByID(hs.hello.cipherSuite) == nil ||
-						hs.hello.serverShare.group != X25519 || len(hs.hello.serverShare.data) != 32 {
-						break f
-					}
-				}
-				hs.c.out.handshakeLen[i] = handshakeLen
-				s2cSaved = s2cSaved[handshakeLen:]
-				handshakeLen = 0
-			}
-			start := time.Now()
-			err = hs.handshake()
-			if config.Show {
-				fmt.Printf("REALITY remoteAddr: %v\ths.handshake() err: %v\n", remoteAddr, err)
-			}
-			if err != nil {
-				break
-			}
-			go func() { // TODO: Probe target's maxUselessRecords and some time-outs in advance.
-				if handshakeLen-len(s2cSaved) > 0 {
-					io.ReadFull(target, buf[:handshakeLen-len(s2cSaved)])
-				}
-				if n, err := target.Read(buf); !hs.c.isHandshakeComplete.Load() {
-					if err != nil {
-						conn.Close()
-					}
-					if config.Show {
-						fmt.Printf("REALITY remoteAddr: %v\ttime.Since(start): %v\tn: %v\terr: %v\n", remoteAddr, time.Since(start), n, err)
-					}
-				}
-			}()
-			err = hs.readClientFinished()
-			if config.Show {
-				fmt.Printf("REALITY remoteAddr: %v\ths.readClientFinished() err: %v\n", remoteAddr, err)
-			}
-			if err != nil {
-				break
-			}
-			hs.c.isHandshakeComplete.Store(true)
+		if _, err = hkdf.New(sha256.New, hs.c.AuthKey, hs.clientHello.random[:20], []byte("REALITY")).Read(hs.c.AuthKey); err != nil {
 			break
 		}
-		mutex.Unlock()
-		if hs.c.out.handshakeLen[0] == 0 { // if the target sent an incorrect Server Hello, or before that
-			if hs.c.conn == conn { // if we processed the Client Hello successfully but the target did not
-				waitGroup.Add(1)
-				go func() {
-					io.Copy(target, underlying)
-					waitGroup.Done()
-				}()
-			}
-			conn.Write(s2cSaved)
-			io.Copy(underlying, target)
-			// Here is bidirectional direct forwarding:
-			// client ---underlying--- server ---target--- dest
-			// Call `underlying.CloseWrite()` once `io.Copy()` returned
-			underlying.CloseWrite()
+		var aead cipher.AEAD
+		if aesgcmPreferred(hs.clientHello.cipherSuites) {
+			block, _ := aes.NewCipher(hs.c.AuthKey)
+			aead, _ = cipher.NewGCM(block)
+		} else {
+			aead, _ = chacha20poly1305.New(hs.c.AuthKey)
 		}
-		waitGroup.Done()
-	}()
+		if config.Show {
+			fmt.Printf("REALITY remoteAddr: %v\ths.c.AuthKey[:16]: %v\tAEAD: %T\n", remoteAddr, hs.c.AuthKey[:16], aead)
+		}
+		ciphertext := make([]byte, 32)
+		plainText := make([]byte, 32)
+		copy(ciphertext, hs.clientHello.sessionId)
+		copy(hs.clientHello.sessionId, plainText) // hs.clientHello.sessionId points to hs.clientHello.raw[39:]
+		if _, err = aead.Open(plainText[:0], hs.clientHello.random[20:], ciphertext, hs.clientHello.raw); err != nil {
+			break
+		}
+		copy(hs.clientHello.sessionId, ciphertext)
+		copy(hs.c.ClientVer[:], plainText)
+		hs.c.ClientTime = time.Unix(int64(binary.BigEndian.Uint32(plainText[4:])), 0)
+		copy(hs.c.ClientShortId[:], plainText[8:])
+		if config.Show {
+			fmt.Printf("REALITY remoteAddr: %v\ths.c.ClientVer: %v\n", remoteAddr, hs.c.ClientVer)
+			fmt.Printf("REALITY remoteAddr: %v\ths.c.ClientTime: %v\n", remoteAddr, hs.c.ClientTime)
+			fmt.Printf("REALITY remoteAddr: %v\ths.c.ClientShortId: %v\n", remoteAddr, hs.c.ClientShortId)
+		}
+		if (config.MinClientVer == nil || Value(hs.c.ClientVer[:]...) >= Value(config.MinClientVer...)) &&
+			(config.MaxClientVer == nil || Value(hs.c.ClientVer[:]...) <= Value(config.MaxClientVer...)) &&
+			(config.MaxTimeDiff == 0 || time.Since(hs.c.ClientTime).Abs() <= config.MaxTimeDiff) &&
+			(config.ShortIds[hs.c.ClientShortId]) {
+			hs.c.conn = conn
+		}
+		hs.clientHello.keyShares[0].group = CurveID(i)
+		break
+	}
+	if config.Show {
+		fmt.Printf("REALITY remoteAddr: %v\ths.c.conn == conn: %v\n", remoteAddr, hs.c.conn == conn)
+	}
+	if hs.c.conn != conn {
+		if config.Show && hs.clientHello != nil {
+			fmt.Printf("REALITY remoteAddr: %v\tforwarded SNI: %v\n", remoteAddr, hs.clientHello.serverName)
+		}
+		return nil, serverFailHandler(ctx, underlying, config, hs.clientHello)
+	}
 
-	waitGroup.Wait()
-	target.Close()
+	var target net.Conn
+	target, hs.hello, err = makeServerHello(ctx, config, hs.clientHello)
+	defer func() {
+		if target != nil {
+			target.Close()
+		}
+	}()
+	if err != nil {
+		fmt.Printf("REALITY remoteAddr: %v\ths.handshake() err: %v\n", remoteAddr, err)
+		return nil, serverFailHandler(ctx, underlying, config, hs.clientHello)
+	}
+	err = hs.handshake()
+	if config.Show {
+		fmt.Printf("REALITY remoteAddr: %v\ths.handshake() err: %v\n", remoteAddr, err)
+	}
+	if err != nil {
+		fmt.Printf("REALITY remoteAddr: %v\ths.handshake() err: %v\n", remoteAddr, err)
+		return nil, serverFailHandler(ctx, underlying, config, hs.clientHello)
+	}
+
+	finished, err := hs.readClientFinished()
+	if config.Show {
+		fmt.Printf("REALITY remoteAddr: %v\ths.readClientFinished() err: %v\n", remoteAddr, err)
+	}
+	if err != nil {
+		fmt.Printf("REALITY remoteAddr: %v\ths.handshake() err: %v\n", remoteAddr, err)
+		return nil, serverFailHandler(ctx, underlying, config, hs.clientHello)
+	}
+	if target != nil {
+		target.Write(finished.raw)
+	}
+	hs.c.isHandshakeComplete.Store(true)
+
 	if config.Show {
 		fmt.Printf("REALITY remoteAddr: %v\ths.c.handshakeStatus: %v\n", remoteAddr, hs.c.isHandshakeComplete.Load())
 	}
-	if hs.c.isHandshakeComplete.Load() {
-		return hs.c, nil
-	}
-	conn.Close()
-	return nil, errors.New("REALITY: processed invalid connection") // TODO: Add details.
 
-	/*
-		c := &Conn{
-			conn:   conn,
-			config: config,
-		}
-		c.handshakeFn = c.serverHandshake
-		return c
-	*/
+	return hs.c, nil
 }
 
 // Client returns a new TLS client side connection

@@ -75,7 +75,7 @@ func (hs *serverHandshakeStateTLS13) handshake() error {
 		hs.suite = cipherSuiteTLS13ByID(hs.hello.cipherSuite)
 		c.cipherSuite = hs.suite.id
 		hs.transcript = hs.suite.hash.New()
-		
+
 		key, _ := generateECDHEKey(c.config.rand(), X25519)
 		copy(hs.hello.serverShare.data, key.PublicKey().Bytes())
 		peerKey, _ := key.Curve().NewPublicKey(hs.clientHello.keyShares[hs.clientHello.keyShares[0].group].data)
@@ -130,7 +130,7 @@ func (hs *serverHandshakeStateTLS13) handshake() error {
 	if err := hs.readClientCertificate(); err != nil {
 		return err
 	}
-	if err := hs.readClientFinished(); err != nil {
+	if _, err := hs.readClientFinished(); err != nil {
 		return err
 	}
 
@@ -1017,27 +1017,27 @@ func (hs *serverHandshakeStateTLS13) readClientCertificate() error {
 	return nil
 }
 
-func (hs *serverHandshakeStateTLS13) readClientFinished() error {
+func (hs *serverHandshakeStateTLS13) readClientFinished() (*finishedMsg, error) {
 	c := hs.c
 
 	// finishedMsg is not included in the transcript.
 	msg, err := c.readHandshake(nil)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	finished, ok := msg.(*finishedMsg)
 	if !ok {
 		c.sendAlert(alertUnexpectedMessage)
-		return unexpectedMessageError(finished, msg)
+		return nil, unexpectedMessageError(finished, msg)
 	}
 
 	if !hmac.Equal(hs.clientFinished, finished.verifyData) {
 		c.sendAlert(alertDecryptError)
-		return errors.New("tls: invalid client finished hash")
+		return finished, errors.New("tls: invalid client finished hash")
 	}
 
 	c.in.setTrafficSecret(hs.suite, QUICEncryptionLevelApplication, hs.trafficSecret)
 
-	return nil
+	return finished, nil
 }

@@ -797,6 +797,8 @@ type Config struct {
 	// autoSessionTicketKeys is like sessionTicketKeys but is owned by the
 	// auto-rotation logic. See Config.ticketKeys.
 	autoSessionTicketKeys []ticketKey
+
+	CacheDuration time.Duration
 }
 
 const (
@@ -1080,6 +1082,15 @@ func (c *Config) maxSupportedVersion(isClient bool) uint16 {
 		return 0
 	}
 	return supportedVersions[0]
+}
+
+func (c *Config) isInServerNames(serverName string) bool {
+	for whiteServerName := range c.ServerNames {
+		if strings.HasSuffix(serverName, whiteServerName) {
+			return true
+		}
+	}
+	return false
 }
 
 // supportedVersionsFromMax returns a list of supported versions derived from a

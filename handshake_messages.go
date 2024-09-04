@@ -7,9 +7,8 @@ package reality
 import (
 	"errors"
 	"fmt"
-	"strings"
-
 	"golang.org/x/crypto/cryptobyte"
+	"strings"
 )
 
 // The marshalingFunction type is an adapter to allow the use of ordinary
