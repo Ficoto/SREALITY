@@ -108,10 +108,11 @@ func serverHelloInCache(chm *clientHelloMsg) (*serverHelloMsg, bool) {
 	if !ok {
 		return nil, false
 	}
-	res, ok := msg.(*serverHelloMsg)
+	shm, ok := msg.(*serverHelloMsg)
 	if !ok {
 		return nil, false
 	}
+	res := *shm
 	res.raw = nil
 	res.sessionId = chm.sessionId
 	res.random = make([]byte, 32)
@@ -121,7 +122,7 @@ func serverHelloInCache(chm *clientHelloMsg) (*serverHelloMsg, bool) {
 			res.cipherSuite = cipherSuite
 		}
 	}
-	return res, ok
+	return &res, ok
 }
 
 func makeServerHello(ctx context.Context, config *Config, msg *clientHelloMsg) (net.Conn, *serverHelloMsg, error) {
