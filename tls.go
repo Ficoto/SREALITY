@@ -249,7 +249,23 @@ func serverFailHandler(ctx context.Context, conn CloseWriteConn, config *Config,
 		conn.Close()
 		return errors.New("REALITY: failed to marshal client hello msg: " + err.Error())
 	}
-	target.Write(data)
+	var outData = make([]byte, recordHeaderLen)
+	vers := msg.vers
+	if vers == 0 {
+		// Some TLS servers fail if the record version is
+		// greater than TLS 1.0 for the initial ClientHello.
+		vers = VersionTLS10
+	} else if vers == VersionTLS13 {
+		// TLS 1.3 froze the record layer version to 1.2.
+		// See RFC 8446, Section 5.1.
+		vers = VersionTLS12
+	}
+	outData[0] = byte(recordTypeHandshake)
+	outData[1] = byte(vers >> 8)
+	outData[2] = byte(vers)
+	outData[3] = byte(len(data) >> 8)
+	outData[4] = byte(len(data))
+	target.Write(append(outData, data...))
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() {
