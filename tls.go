@@ -351,6 +351,9 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 			fmt.Printf("REALITY remoteAddr: %v\ths.c.ClientVer: %v\n", remoteAddr, hs.c.ClientVer)
 			fmt.Printf("REALITY remoteAddr: %v\ths.c.ClientTime: %v\n", remoteAddr, hs.c.ClientTime)
 			fmt.Printf("REALITY remoteAddr: %v\ths.c.ClientShortId: %v\n", remoteAddr, hs.c.ClientShortId)
+			if config.MaxTimeDiff != 0 && time.Since(hs.c.ClientTime).Abs() > config.MaxTimeDiff {
+				fmt.Printf("REALITY remoteAddr: %v\ttime since hs.c.ClientTime: %v\n", remoteAddr, time.Since(hs.c.ClientTime).Abs())
+			}
 		}
 		if (config.MinClientVer == nil || Value(hs.c.ClientVer[:]...) >= Value(config.MinClientVer...)) &&
 			(config.MaxClientVer == nil || Value(hs.c.ClientVer[:]...) <= Value(config.MaxClientVer...)) &&
