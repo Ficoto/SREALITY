@@ -130,7 +130,7 @@ func (hs *serverHandshakeStateTLS13) handshake() error {
 	if err := hs.readClientCertificate(); err != nil {
 		return err
 	}
-	if _, err := hs.readClientFinished(); err != nil {
+	if err := hs.readClientFinished(); err != nil {
 		return err
 	}
 
@@ -1017,27 +1017,27 @@ func (hs *serverHandshakeStateTLS13) readClientCertificate() error {
 	return nil
 }
 
-func (hs *serverHandshakeStateTLS13) readClientFinished() (*finishedMsg, error) {
+func (hs *serverHandshakeStateTLS13) readClientFinished() error {
 	c := hs.c
 
 	// finishedMsg is not included in the transcript.
 	msg, err := c.readHandshake(nil)
 	if err != nil {
-		return nil, err
+		return err
 	}
 
 	finished, ok := msg.(*finishedMsg)
 	if !ok {
 		c.sendAlert(alertUnexpectedMessage)
-		return nil, unexpectedMessageError(finished, msg)
+		return unexpectedMessageError(finished, msg)
 	}
 
 	if !hmac.Equal(hs.clientFinished, finished.verifyData) {
 		c.sendAlert(alertDecryptError)
-		return finished, errors.New("tls: invalid client finished hash")
+		return errors.New("tls: invalid client finished hash")
 	}
 
 	c.in.setTrafficSecret(hs.suite, QUICEncryptionLevelApplication, hs.trafficSecret)
 
-	return finished, nil
+	return nil
 }
