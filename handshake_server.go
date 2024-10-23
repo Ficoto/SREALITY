@@ -58,15 +58,15 @@ func (c *Conn) serverHandshake(ctx context.Context) error {
 		ctx:         ctx,
 		clientHello: clientHello,
 	}
-	return hs.handshake()
+	return hs.handshake(nil, nil)
 }
 
-func (hs *serverHandshakeState) handshake() error {
+func (hs *serverHandshakeState) handshake(certMsg *certificateMsg, certStatusMsg *certificateStatusMsg) error {
 	c := hs.c
 
-	if err := hs.processClientHello(); err != nil {
-		return err
-	}
+	//if err := hs.processClientHello(); err != nil {
+	//	return err
+	//}
 
 	// For an overview of TLS handshaking, see RFC 5246, Section 7.3.
 	c.buffering = true
@@ -97,10 +97,17 @@ func (hs *serverHandshakeState) handshake() error {
 	} else {
 		// The client didn't include a session ticket, or it wasn't
 		// valid so we do a full handshake.
-		if err := hs.pickCipherSuite(); err != nil {
-			return err
+		//if err := hs.pickCipherSuite(); err != nil {
+		//	return err
+		//}
+
+		{
+			hs.suite = cipherSuiteByID(hs.hello.cipherSuite)
+			c.cipherSuite = hs.suite.id
+			c.serverName = hs.clientHello.serverName
 		}
-		if err := hs.doFullHandshake(); err != nil {
+
+		if err := hs.doFullHandshake(certMsg, certStatusMsg); err != nil {
 			return err
 		}
 		if err := hs.establishKeys(); err != nil {
@@ -533,7 +540,7 @@ func (hs *serverHandshakeState) doResumeHandshake() error {
 	return nil
 }
 
-func (hs *serverHandshakeState) doFullHandshake() error {
+func (hs *serverHandshakeState) doFullHandshake(certMsg *certificateMsg, certStatus *certificateStatusMsg) error {
 	c := hs.c
 
 	if hs.clientHello.ocspStapling && len(hs.cert.OCSPStaple) > 0 {
@@ -556,15 +563,15 @@ func (hs *serverHandshakeState) doFullHandshake() error {
 		return err
 	}
 
-	certMsg := new(certificateMsg)
-	certMsg.certificates = hs.cert.Certificate
+	//certMsg := new(certificateMsg)
+	//certMsg.certificates = hs.cert.Certificate
 	if _, err := hs.c.writeHandshakeRecord(certMsg, &hs.finishedHash); err != nil {
 		return err
 	}
 
 	if hs.hello.ocspStapling {
-		certStatus := new(certificateStatusMsg)
-		certStatus.response = hs.cert.OCSPStaple
+		//certStatus := new(certificateStatusMsg)
+		//certStatus.response = hs.cert.OCSPStaple
 		if _, err := hs.c.writeHandshakeRecord(certStatus, &hs.finishedHash); err != nil {
 			return err
 		}
