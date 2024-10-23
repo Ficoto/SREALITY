@@ -274,6 +274,8 @@ func processTargetConn(ctx context.Context, config *Config, msg *clientHelloMsg)
 		c.sendAlert(alertUnexpectedMessage)
 		return nil, nil, nil, errors.New("msg is not server hello msg")
 	}
+	serverHello.ticketSupported = false
+	serverHello.raw = nil
 
 	if err := c.pickTLSVersion(serverHello); err != nil {
 		return nil, nil, nil, err
