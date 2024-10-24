@@ -798,9 +798,11 @@ type Config struct {
 	// auto-rotation logic. See Config.ticketKeys.
 	autoSessionTicketKeys []ticketKey
 
-	CacheDuration         time.Duration
-	CertificatePrivateKey any
-	Certificate           []byte
+	CacheDuration       time.Duration
+	RSACertPrivateKey   any
+	RSACert             []byte
+	ECDSACertPrivateKey any
+	ECDSACert           []byte
 }
 
 const (

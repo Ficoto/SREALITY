@@ -421,6 +421,30 @@ func serverFailHandler(ctx context.Context, conn CloseWriteConn, config *Config,
 	return errors.New("REALITY: processed invalid connection")
 }
 
+func certByCertMsg(msg *certificateMsg, config *Config) *Certificate {
+	if len(msg.certificates) == 0 {
+		return nil
+	}
+	certificate, _ := x509.ParseCertificates(msg.certificates[0])
+	if len(certificate) == 0 {
+		return nil
+	}
+	switch certificate[0].PublicKeyAlgorithm {
+	case x509.RSA:
+		return &Certificate{
+			PrivateKey:  config.RSACertPrivateKey,
+			Certificate: [][]byte{config.RSACert},
+		}
+	case x509.ECDSA:
+		return &Certificate{
+			PrivateKey:  config.ECDSACertPrivateKey,
+			Certificate: [][]byte{config.ECDSACert},
+		}
+	default:
+		return nil
+	}
+}
+
 // Server returns a new TLS server side connection
 // using conn as the underlying transport.
 // The configuration config must be non-nil and must include
@@ -505,13 +529,14 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 		return hs.c, nil
 	}
 
+	cert := certByCertMsg(certMsg, config)
+	if cert == nil {
+		return nil, serverFailHandler(ctx, underlying, config, clientHelloMsg)
+	}
 	hs := serverHandshakeState{
-		c:   c,
-		ctx: context.Background(),
-		cert: &Certificate{
-			Certificate: [][]byte{config.Certificate},
-			PrivateKey:  config.CertificatePrivateKey,
-		},
+		c:    c,
+		ctx:  context.Background(),
+		cert: cert,
 	}
 	hs.clientHello = clientHelloMsg
 	hs.hello = serverHelloMsg
