@@ -799,9 +799,9 @@ type Config struct {
 	autoSessionTicketKeys []ticketKey
 
 	CacheDuration       time.Duration
-	RSACertPrivateKey   any
+	RSACertPrivateKey   *rsa.PrivateKey
 	RSACert             []byte
-	ECDSACertPrivateKey any
+	ECDSACertPrivateKey *ecdsa.PrivateKey
 	ECDSACert           []byte
 }
 
