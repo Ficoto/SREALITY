@@ -181,7 +181,10 @@ func serverHelloInCache(chm *clientHelloMsg) (*serverHelloMsg, bool) {
 	}
 	res := *shm
 	res.raw = nil
-	res.sessionId = chm.sessionId
+	if len(res.sessionId) != 0 {
+		res.sessionId = make([]byte, len(res.sessionId))
+		rand.Read(res.sessionId)
+	}
 	res.random = make([]byte, 32)
 	rand.Read(res.random)
 	return &res, ok
@@ -274,8 +277,6 @@ func processTargetConn(ctx context.Context, config *Config, msg *clientHelloMsg)
 		c.sendAlert(alertUnexpectedMessage)
 		return nil, nil, nil, errors.New("msg is not server hello msg")
 	}
-	serverHello.ticketSupported = false
-	serverHello.raw = nil
 
 	if err := c.pickTLSVersion(serverHello); err != nil {
 		return nil, nil, nil, err
