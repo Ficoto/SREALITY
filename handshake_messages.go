@@ -736,10 +736,103 @@ type serverHelloMsg struct {
 	// HelloRetryRequest extensions
 	cookie        []byte
 	selectedGroup CurveID
+
+	extensionsList []uint16
 }
 
-func (m *serverHelloMsg) marshal() ([]byte, error) {
+func (m *serverHelloMsg) generateExtensionsBuilder() *cryptobyte.Builder {
 	var exts cryptobyte.Builder
+	if len(m.extensionsList) != 0 {
+		for _, extension := range m.extensionsList {
+			switch extension {
+			case extensionStatusRequest:
+				exts.AddUint16(extensionStatusRequest)
+				exts.AddUint16(0) // empty extension_data
+			case extensionSessionTicket:
+				exts.AddUint16(extensionSessionTicket)
+				exts.AddUint16(0) // empty extension_data
+			case extensionRenegotiationInfo:
+				exts.AddUint16(extensionRenegotiationInfo)
+				exts.AddUint16LengthPrefixed(func(exts *cryptobyte.Builder) {
+					exts.AddUint8LengthPrefixed(func(exts *cryptobyte.Builder) {
+						exts.AddBytes(m.secureRenegotiation)
+					})
+				})
+			case extensionExtendedMasterSecret:
+				exts.AddUint16(extensionExtendedMasterSecret)
+				exts.AddUint16(0) // empty extension_data
+			case extensionALPN:
+				exts.AddUint16(extensionALPN)
+				exts.AddUint16LengthPrefixed(func(exts *cryptobyte.Builder) {
+					exts.AddUint16LengthPrefixed(func(exts *cryptobyte.Builder) {
+						exts.AddUint8LengthPrefixed(func(exts *cryptobyte.Builder) {
+							exts.AddBytes([]byte(m.alpnProtocol))
+						})
+					})
+				})
+			case extensionSCT:
+				exts.AddUint16(extensionSCT)
+				exts.AddUint16LengthPrefixed(func(exts *cryptobyte.Builder) {
+					exts.AddUint16LengthPrefixed(func(exts *cryptobyte.Builder) {
+						for _, sct := range m.scts {
+							exts.AddUint16LengthPrefixed(func(exts *cryptobyte.Builder) {
+								exts.AddBytes(sct)
+							})
+						}
+					})
+				})
+			case extensionSupportedVersions:
+				exts.AddUint16(extensionSupportedVersions)
+				exts.AddUint16LengthPrefixed(func(exts *cryptobyte.Builder) {
+					exts.AddUint16(m.supportedVersion)
+				})
+			case extensionKeyShare:
+				if m.serverShare.group != 0 {
+					exts.AddUint16(extensionKeyShare)
+					exts.AddUint16LengthPrefixed(func(exts *cryptobyte.Builder) {
+						exts.AddUint16(uint16(m.serverShare.group))
+						exts.AddUint16LengthPrefixed(func(exts *cryptobyte.Builder) {
+							exts.AddBytes(m.serverShare.data)
+						})
+					})
+				}
+				if m.selectedGroup != 0 {
+					exts.AddUint16(extensionKeyShare)
+					exts.AddUint16LengthPrefixed(func(exts *cryptobyte.Builder) {
+						exts.AddUint16(uint16(m.selectedGroup))
+					})
+				}
+			case extensionPreSharedKey:
+				exts.AddUint16(extensionPreSharedKey)
+				exts.AddUint16LengthPrefixed(func(exts *cryptobyte.Builder) {
+					exts.AddUint16(m.selectedIdentity)
+				})
+			case extensionCookie:
+				exts.AddUint16(extensionCookie)
+				exts.AddUint16LengthPrefixed(func(exts *cryptobyte.Builder) {
+					exts.AddUint16LengthPrefixed(func(exts *cryptobyte.Builder) {
+						exts.AddBytes(m.cookie)
+					})
+				})
+			case extensionSupportedPoints:
+				exts.AddUint16(extensionSupportedPoints)
+				exts.AddUint16LengthPrefixed(func(exts *cryptobyte.Builder) {
+					exts.AddUint8LengthPrefixed(func(exts *cryptobyte.Builder) {
+						exts.AddBytes(m.supportedPoints)
+					})
+				})
+			case extensionEncryptedClientHello:
+				exts.AddUint16(extensionEncryptedClientHello)
+				exts.AddUint16LengthPrefixed(func(exts *cryptobyte.Builder) {
+					exts.AddBytes(m.encryptedClientHello)
+				})
+			case extensionServerName:
+				exts.AddUint16(extensionServerName)
+				exts.AddUint16(0)
+			}
+		}
+		return &exts
+	}
 	if m.ocspStapling {
 		exts.AddUint16(extensionStatusRequest)
 		exts.AddUint16(0) // empty extension_data
@@ -836,7 +929,11 @@ func (m *serverHelloMsg) marshal() ([]byte, error) {
 		exts.AddUint16(extensionServerName)
 		exts.AddUint16(0)
 	}
+	return &exts
+}
 
+func (m *serverHelloMsg) marshal() ([]byte, error) {
+	exts := m.generateExtensionsBuilder()
 	extBytes, err := exts.Bytes()
 	if err != nil {
 		return nil, err
@@ -898,6 +995,7 @@ func (m *serverHelloMsg) unmarshal(data []byte) bool {
 			return false
 		}
 		seenExts[extension] = true
+		m.extensionsList = append(m.extensionsList, extension)
 
 		switch extension {
 		case extensionStatusRequest:
