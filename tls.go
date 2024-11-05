@@ -182,8 +182,7 @@ func serverHelloInCache(chm *clientHelloMsg) (*serverHelloMsg, bool) {
 	res := *shm
 	res.original = nil
 	if len(res.sessionId) != 0 {
-		res.sessionId = make([]byte, len(res.sessionId))
-		rand.Read(res.sessionId)
+		res.sessionId = chm.sessionId
 	}
 	res.random = make([]byte, 32)
 	rand.Read(res.random)
