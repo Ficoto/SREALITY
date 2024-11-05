@@ -128,7 +128,7 @@ func processClientHelloMsg(ctx context.Context, remoteAddr string, conn *Conn, s
 		plainText := make([]byte, 32)
 		copy(ciphertext, cHelloMsg.sessionId)
 		copy(cHelloMsg.sessionId, plainText) // hs.clientHello.sessionId points to hs.clientHello.raw[39:]
-		if _, err = aead.Open(plainText[:0], cHelloMsg.random[20:], ciphertext, cHelloMsg.raw); err != nil {
+		if _, err = aead.Open(plainText[:0], cHelloMsg.random[20:], ciphertext, cHelloMsg.original); err != nil {
 			break
 		}
 		copy(cHelloMsg.sessionId, ciphertext)
@@ -180,7 +180,7 @@ func serverHelloInCache(chm *clientHelloMsg) (*serverHelloMsg, bool) {
 		return nil, false
 	}
 	res := *shm
-	res.raw = nil
+	res.original = nil
 	if len(res.sessionId) != 0 {
 		res.sessionId = make([]byte, len(res.sessionId))
 		rand.Read(res.sessionId)
