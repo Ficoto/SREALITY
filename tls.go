@@ -302,6 +302,10 @@ func processTargetConn(ctx context.Context, config *Config, msg *clientHelloMsg)
 			hello:       msg,
 		}
 		hs.handshake()
+		if cipherSuiteTLS13ByID(serverHello.cipherSuite) == nil ||
+			serverHello.serverShare.group != X25519 || len(serverHello.serverShare.data) != 32 {
+			return nil, nil, nil, errors.New("invalid server hello")
+		}
 		return serverHello, nil, nil, nil
 	}
 
