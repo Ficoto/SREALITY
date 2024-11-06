@@ -122,6 +122,8 @@ const (
 	extensionKeyShare                uint16 = 51
 	extensionQUICTransportParameters uint16 = 57
 	extensionRenegotiationInfo       uint16 = 0xff01
+	extensionECHOuterExtensions      uint16 = 0xfd00
+	extensionEncryptedClientHello    uint16 = 0xfe0d
 )
 
 // TLS signaling cipher suite values
@@ -798,7 +800,11 @@ type Config struct {
 	// auto-rotation logic. See Config.ticketKeys.
 	autoSessionTicketKeys []ticketKey
 
-	CacheDuration time.Duration
+	CacheDuration       time.Duration
+	RSACertPrivateKey   *rsa.PrivateKey
+	RSACert             []byte
+	ECDSACertPrivateKey *ecdsa.PrivateKey
+	ECDSACert           []byte
 }
 
 const (
