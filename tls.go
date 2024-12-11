@@ -407,7 +407,7 @@ func serverFailHandler(ctx context.Context, conn CloseWriteConn, config *Config,
 		conn.Close()
 		return errors.New("REALITY: destTarget is nil")
 	}
-	target, err := config.DialContext(ctx, config.Type, destTarget)
+	target, err := config.DialContext(ctx, config.Type, fmt.Sprintf("%s:443", destTarget))
 	if err != nil {
 		conn.Close()
 		return errors.New("REALITY: failed to dial dest: " + err.Error())
