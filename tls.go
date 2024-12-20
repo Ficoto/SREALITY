@@ -404,10 +404,15 @@ func serverFailHandler(ctx context.Context, conn CloseWriteConn, config *Config,
 	}
 	destTarget := dest.LoadLatestServerName()
 	if len(destTarget) == 0 {
-		conn.Close()
-		return errors.New("REALITY: destTarget is nil")
+		if len(config.Dest) == 0 {
+			conn.Close()
+			return errors.New("REALITY: destTarget is nil")
+		}
+		destTarget = config.Dest
+	} else {
+		destTarget = fmt.Sprintf("%s:443", destTarget)
 	}
-	target, err := config.DialContext(ctx, config.Type, fmt.Sprintf("%s:443", destTarget))
+	target, err := config.DialContext(ctx, config.Type, destTarget)
 	if err != nil {
 		conn.Close()
 		return errors.New("REALITY: failed to dial dest: " + err.Error())
