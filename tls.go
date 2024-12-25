@@ -99,6 +99,23 @@ func Value(vals ...byte) (value int) {
 	return
 }
 
+type latestServerName struct {
+	value string
+	lock  sync.RWMutex
+}
+
+func (lsn *latestServerName) SetLatestServerName(serverName string) {
+	lsn.lock.Lock()
+	defer lsn.lock.Unlock()
+	lsn.value = serverName
+}
+
+func (lsn *latestServerName) LoadLatestServerName() string {
+	lsn.lock.RLock()
+	defer lsn.lock.RUnlock()
+	return lsn.value
+}
+
 func processClientHelloMsg(ctx context.Context, remoteAddr string, conn *Conn, sourceConn net.Conn, config *Config) (*clientHelloMsg, error) {
 	cHelloMsg, err := conn.readClientHello(ctx)
 	if err != nil || conn.vers != VersionTLS13 || !config.isInServerNames(cHelloMsg.serverName) {
@@ -129,6 +146,7 @@ func processClientHelloMsg(ctx context.Context, remoteAddr string, conn *Conn, s
 		copy(ciphertext, cHelloMsg.sessionId)
 		copy(cHelloMsg.sessionId, plainText) // hs.clientHello.sessionId points to hs.clientHello.raw[39:]
 		if _, err = aead.Open(plainText[:0], cHelloMsg.random[20:], ciphertext, cHelloMsg.original); err != nil {
+			copy(cHelloMsg.sessionId, ciphertext)
 			break
 		}
 		copy(cHelloMsg.sessionId, ciphertext)
@@ -149,7 +167,7 @@ func processClientHelloMsg(ctx context.Context, remoteAddr string, conn *Conn, s
 		cHelloMsg.keyShares[0].group = CurveID(i)
 		break
 	}
-	return cHelloMsg, nil
+	return cHelloMsg, err
 }
 
 type cacheKey string
@@ -168,6 +186,7 @@ var (
 	targetResponseCache = cache.New(5*time.Minute, 10*time.Minute)
 	targetConnLock      = new(sync.Mutex)
 	ErrorCacheNotFound  = errors.New("cache not found")
+	dest                latestServerName
 )
 
 func serverHelloInCache(chm *clientHelloMsg) (*serverHelloMsg, bool) {
@@ -244,6 +263,7 @@ func processTargetConnWithCache(ctx context.Context, config *Config, msg *client
 	if err != nil {
 		return nil, nil, nil, err
 	}
+	go dest.SetLatestServerName(msg.serverName)
 	targetResponseCache.Set(serverHelloCacheKey.Key(msg.serverName), serverHello, config.CacheDuration)
 	targetResponseCache.Set(certCacheKey.Key(msg.serverName), certMsg, config.CacheDuration)
 	targetResponseCache.Set(certStatusCacheKey.Key(msg.serverName), certStatusMsg, config.CacheDuration)
@@ -382,7 +402,17 @@ func serverFailHandler(ctx context.Context, conn CloseWriteConn, config *Config,
 		conn.Close()
 		return errors.New("REALITY: client hello msg is nil")
 	}
-	target, err := config.DialContext(ctx, config.Type, config.Dest)
+	destTarget := dest.LoadLatestServerName()
+	if len(destTarget) == 0 {
+		if len(config.Dest) == 0 {
+			conn.Close()
+			return errors.New("REALITY: destTarget is nil")
+		}
+		destTarget = config.Dest
+	} else {
+		destTarget = fmt.Sprintf("%s:443", destTarget)
+	}
+	target, err := config.DialContext(ctx, config.Type, destTarget)
 	if err != nil {
 		conn.Close()
 		return errors.New("REALITY: failed to dial dest: " + err.Error())
