@@ -1091,6 +1091,9 @@ func (c *Config) maxSupportedVersion(isClient bool) uint16 {
 }
 
 func (c *Config) isInServerNames(serverName string) bool {
+	if len(serverName) == 0 {
+		return false
+	}
 	for whiteServerName := range c.ServerNames {
 		if strings.HasSuffix(serverName, whiteServerName) {
 			return true
