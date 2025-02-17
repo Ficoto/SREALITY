@@ -184,7 +184,6 @@ const (
 
 var (
 	targetResponseCache = cache.New(5*time.Minute, 10*time.Minute)
-	targetConnLock      = new(sync.Mutex)
 	ErrorCacheNotFound  = errors.New("cache not found")
 	dest                latestServerName
 )
@@ -253,20 +252,16 @@ func processTargetConnWithCache(ctx context.Context, config *Config, msg *client
 	if err == nil {
 		return serverHello, certMsg, certStatusMsg, nil
 	}
-	targetConnLock.Lock()
-	defer targetConnLock.Unlock()
-	serverHello, certMsg, certStatusMsg, err = targetResponseInCache(msg)
-	if err == nil {
-		return serverHello, certMsg, certStatusMsg, nil
-	}
 	serverHello, certMsg, certStatusMsg, err = processTargetConn(ctx, config, msg)
 	if err != nil {
 		return nil, nil, nil, err
 	}
 	go dest.SetLatestServerName(msg.serverName)
-	targetResponseCache.Set(serverHelloCacheKey.Key(msg.serverName), serverHello, config.CacheDuration)
-	targetResponseCache.Set(certCacheKey.Key(msg.serverName), certMsg, config.CacheDuration)
-	targetResponseCache.Set(certStatusCacheKey.Key(msg.serverName), certStatusMsg, config.CacheDuration)
+	if config.CacheDuration != 0 {
+		targetResponseCache.Set(serverHelloCacheKey.Key(msg.serverName), serverHello, config.CacheDuration)
+		targetResponseCache.Set(certCacheKey.Key(msg.serverName), certMsg, config.CacheDuration)
+		targetResponseCache.Set(certStatusCacheKey.Key(msg.serverName), certStatusMsg, config.CacheDuration)
+	}
 	return serverHello, certMsg, certStatusMsg, nil
 }
 
