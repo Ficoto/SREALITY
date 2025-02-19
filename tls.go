@@ -19,15 +19,18 @@ import (
 	"crypto/cipher"
 	"crypto/ecdsa"
 	"crypto/ed25519"
+	"crypto/md5"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/pem"
 	"errors"
 	"fmt"
 	"github.com/patrickmn/go-cache"
+	"golang.org/x/crypto/cryptobyte"
 	"io"
 	"net"
 	"os"
@@ -171,14 +174,14 @@ func processClientHelloMsg(ctx context.Context, remoteAddr string, conn *Conn, s
 
 type cacheKey string
 
-func (ck cacheKey) Key(serverName string) string {
-	return fmt.Sprintf(string(ck), serverName)
+func (ck cacheKey) Key(serverName string, clientHelloMsgMD5 string) string {
+	return fmt.Sprintf(string(ck), serverName, clientHelloMsgMD5)
 }
 
 const (
-	serverHelloCacheKey cacheKey = "%s:server_hello"
-	certCacheKey        cacheKey = "%s:cert"
-	certStatusCacheKey  cacheKey = "%s:cert_status"
+	serverHelloCacheKey cacheKey = "%s:%s:server_hello"
+	certCacheKey        cacheKey = "%s:%s:cert"
+	certStatusCacheKey  cacheKey = "%s:%s:cert_status"
 )
 
 var (
@@ -188,8 +191,8 @@ var (
 	cacheLockMap        = make(map[string]*sync.Mutex)
 )
 
-func serverHelloInCache(chm *clientHelloMsg) (*serverHelloMsg, bool) {
-	msg, ok := targetResponseCache.Get(serverHelloCacheKey.Key(chm.serverName))
+func serverHelloInCache(chm *clientHelloMsg, chmMD5 string) (*serverHelloMsg, bool) {
+	msg, ok := targetResponseCache.Get(serverHelloCacheKey.Key(chm.serverName, chmMD5))
 	if !ok {
 		return nil, false
 	}
@@ -207,8 +210,8 @@ func serverHelloInCache(chm *clientHelloMsg) (*serverHelloMsg, bool) {
 	return &res, ok
 }
 
-func certMsgInCache(chm *clientHelloMsg) (*certificateMsg, bool) {
-	msg, ok := targetResponseCache.Get(certCacheKey.Key(chm.serverName))
+func certMsgInCache(chm *clientHelloMsg, chmMD5 string) (*certificateMsg, bool) {
+	msg, ok := targetResponseCache.Get(certCacheKey.Key(chm.serverName, chmMD5))
 	if !ok {
 		return nil, false
 	}
@@ -216,8 +219,8 @@ func certMsgInCache(chm *clientHelloMsg) (*certificateMsg, bool) {
 	return certMsg, ok
 }
 
-func certStatusInCache(chm *clientHelloMsg) (*certificateStatusMsg, bool) {
-	msg, ok := targetResponseCache.Get(certStatusCacheKey.Key(chm.serverName))
+func certStatusInCache(chm *clientHelloMsg, chmMD5 string) (*certificateStatusMsg, bool) {
+	msg, ok := targetResponseCache.Get(certStatusCacheKey.Key(chm.serverName, chmMD5))
 	if !ok {
 		return nil, false
 	}
@@ -225,46 +228,136 @@ func certStatusInCache(chm *clientHelloMsg) (*certificateStatusMsg, bool) {
 	return certStatusMsg, ok
 }
 
-func targetResponseInCache(chm *clientHelloMsg) (*serverHelloMsg, *certificateMsg, *certificateStatusMsg, error) {
-	serverHello, ok := serverHelloInCache(chm)
+func targetResponseInCache(chm *clientHelloMsg, chmMD5 string) (*serverHelloMsg, *certificateMsg, *certificateStatusMsg, error) {
+	serverHello, ok := serverHelloInCache(chm, chmMD5)
 	if !ok {
 		return nil, nil, nil, ErrorCacheNotFound
 	}
 	if serverHello.vers == VersionTLS13 || serverHello.supportedVersion == VersionTLS13 {
 		return serverHello, nil, nil, nil
 	}
-	certMsg, ok := certMsgInCache(chm)
+	certMsg, ok := certMsgInCache(chm, chmMD5)
 	if !ok {
 		return nil, nil, nil, ErrorCacheNotFound
 	}
 	if !serverHello.ocspStapling {
 		return serverHello, certMsg, nil, nil
 	}
-	certStatusMsg, ok := certStatusInCache(chm)
+	certStatusMsg, ok := certStatusInCache(chm, chmMD5)
 	if !ok {
 		return nil, nil, nil, ErrorCacheNotFound
 	}
 	return serverHello, certMsg, certStatusMsg, nil
 }
 
-func setCacheForClientHello(chm *clientHelloMsg, config *Config, shm *serverHelloMsg, cm *certificateMsg, csm *certificateStatusMsg) {
+func setCacheForClientHello(chm *clientHelloMsg, config *Config, shm *serverHelloMsg, cm *certificateMsg, csm *certificateStatusMsg, chmMD5 string) {
 	if config.CacheDuration <= 0 {
 		return
 	}
-	lock, ok := cacheLockMap[serverHelloCacheKey.Key(chm.serverName)]
+	lock, ok := cacheLockMap[serverHelloCacheKey.Key(chm.serverName, chmMD5)]
 	if !ok {
 		lock = &sync.Mutex{}
-		cacheLockMap[serverHelloCacheKey.Key(chm.serverName)] = lock
+		cacheLockMap[serverHelloCacheKey.Key(chm.serverName, chmMD5)] = lock
 	}
 	lock.Lock()
 	defer lock.Unlock()
-	targetResponseCache.Set(serverHelloCacheKey.Key(chm.serverName), shm, config.CacheDuration)
-	targetResponseCache.Set(certCacheKey.Key(chm.serverName), cm, config.CacheDuration)
-	targetResponseCache.Set(certStatusCacheKey.Key(chm.serverName), csm, config.CacheDuration)
+	targetResponseCache.Set(serverHelloCacheKey.Key(chm.serverName, chmMD5), shm, config.CacheDuration)
+	targetResponseCache.Set(certCacheKey.Key(chm.serverName, chmMD5), cm, config.CacheDuration)
+	targetResponseCache.Set(certStatusCacheKey.Key(chm.serverName, chmMD5), csm, config.CacheDuration)
+}
+
+func isGREASEUint16(v uint16) bool {
+	// First byte is same as second byte
+	// and lowest nibble is 0xa
+	return ((v >> 8) == v&0xff) && v&0xf == 0xa
+}
+
+func clientHelloMsgMD5(msg *clientHelloMsg) string {
+	var b cryptobyte.Builder
+	for _, cs := range msg.cipherSuites {
+		if isGREASEUint16(cs) {
+			continue
+		}
+		b.AddUint16(cs)
+	}
+	var exts cryptobyte.Builder
+	if len(msg.serverName) > 0 {
+		exts.AddUint16(extensionServerName)
+	}
+	if len(msg.supportedPoints) > 0 {
+		exts.AddUint16(extensionSupportedPoints)
+	}
+	if msg.ticketSupported {
+		exts.AddUint16(extensionSessionTicket)
+	}
+	if msg.secureRenegotiationSupported {
+		exts.AddUint16(extensionRenegotiationInfo)
+	}
+	if msg.extendedMasterSecret {
+		exts.AddUint16(extensionExtendedMasterSecret)
+	}
+	if msg.scts {
+		exts.AddUint16(extensionSCT)
+	}
+	if msg.earlyData {
+		exts.AddUint16(extensionEarlyData)
+	}
+	if msg.quicTransportParameters != nil {
+		exts.AddUint16(extensionQUICTransportParameters)
+	}
+	if len(msg.encryptedClientHello) > 0 {
+		exts.AddUint16(extensionEncryptedClientHello)
+	}
+	if msg.ocspStapling {
+		exts.AddUint16(extensionStatusRequest)
+	}
+	if len(msg.supportedCurves) > 0 {
+		exts.AddUint16(extensionSupportedCurves)
+	}
+	if len(msg.supportedSignatureAlgorithms) > 0 {
+		exts.AddUint16(extensionSignatureAlgorithms)
+	}
+	if len(msg.supportedSignatureAlgorithmsCert) > 0 {
+		exts.AddUint16(extensionSignatureAlgorithmsCert)
+	}
+	if len(msg.alpnProtocols) > 0 {
+		exts.AddUint16(extensionALPN)
+	}
+	if len(msg.supportedVersions) > 0 {
+		exts.AddUint16(extensionSupportedVersions)
+	}
+	if len(msg.cookie) > 0 {
+		exts.AddUint16(extensionCookie)
+	}
+	if len(msg.keyShares) > 0 {
+		exts.AddUint16(extensionKeyShare)
+	}
+	if len(msg.pskModes) > 0 {
+		exts.AddUint16(extensionPSKModes)
+	}
+	if len(msg.pskIdentities) > 0 {
+		exts.AddUint16(extensionPreSharedKey)
+	}
+	extBytes, _ := exts.Bytes()
+	b.AddUint8LengthPrefixed(func(b *cryptobyte.Builder) {
+		b.AddBytes(msg.compressionMethods)
+	})
+	if len(extBytes) > 0 {
+		b.AddUint16LengthPrefixed(func(b *cryptobyte.Builder) {
+			b.AddBytes(extBytes)
+		})
+	}
+	clientHelloBytes, _ := b.Bytes()
+	hash := md5.Sum(clientHelloBytes)
+	return hex.EncodeToString(hash[:])
 }
 
 func processTargetConnWithCache(ctx context.Context, config *Config, msg *clientHelloMsg) (*serverHelloMsg, *certificateMsg, *certificateStatusMsg, error) {
-	serverHello, certMsg, certStatusMsg, err := targetResponseInCache(msg)
+	if config.CacheDuration == 0 {
+		return processTargetConn(ctx, config, msg)
+	}
+	chmMD5 := clientHelloMsgMD5(msg)
+	serverHello, certMsg, certStatusMsg, err := targetResponseInCache(msg, chmMD5)
 	if err == nil {
 		return serverHello, certMsg, certStatusMsg, nil
 	}
@@ -273,7 +366,7 @@ func processTargetConnWithCache(ctx context.Context, config *Config, msg *client
 		return nil, nil, nil, err
 	}
 	go dest.SetLatestServerName(msg.serverName)
-	go setCacheForClientHello(msg, config, serverHello, certMsg, certStatusMsg)
+	go setCacheForClientHello(msg, config, serverHello, certMsg, certStatusMsg, chmMD5)
 	return serverHello, certMsg, certStatusMsg, nil
 }
 
