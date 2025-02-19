@@ -78,7 +78,14 @@ func (hs *serverHandshakeStateTLS13) handshake() error {
 
 		key, _ := generateECDHEKey(c.config.rand(), X25519)
 		copy(hs.hello.serverShare.data, key.PublicKey().Bytes())
-		peerKey, _ := key.Curve().NewPublicKey(hs.clientHello.keyShares[hs.clientHello.keyShares[0].group].data)
+		var data []byte
+		for _, keyShare := range hs.clientHello.keyShares {
+			if keyShare.group != X25519 {
+				continue
+			}
+			data = keyShare.data
+		}
+		peerKey, _ := key.Curve().NewPublicKey(data)
 		hs.sharedKey, _ = key.ECDH(peerKey)
 
 		c.serverName = hs.clientHello.serverName

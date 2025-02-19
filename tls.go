@@ -118,18 +118,18 @@ func (lsn *latestServerName) LoadLatestServerName() string {
 
 func processClientHelloMsg(ctx context.Context, remoteAddr string, conn *Conn, sourceConn net.Conn, config *Config) (*clientHelloMsg, error) {
 	cHelloMsg, err := conn.readClientHello(ctx)
-	if err != nil || conn.vers != VersionTLS13 || !config.isInServerNames(cHelloMsg.serverName) {
+	if err != nil || !config.isInServerNames(cHelloMsg.serverName) {
 		return cHelloMsg, InvalidClientHelloError
 	}
-	for i, keyShare := range cHelloMsg.keyShares {
+	for _, keyShare := range cHelloMsg.keyShares {
 		if keyShare.group != X25519 || len(keyShare.data) != 32 {
 			continue
 		}
 		if conn.AuthKey, err = curve25519.X25519(config.PrivateKey, keyShare.data); err != nil {
-			return nil, err
+			return cHelloMsg, err
 		}
 		if _, err = hkdf.New(sha256.New, conn.AuthKey, cHelloMsg.random[:20], []byte("REALITY")).Read(conn.AuthKey); err != nil {
-			return nil, err
+			return cHelloMsg, err
 		}
 		var aead cipher.AEAD
 		if aesgcmPreferred(cHelloMsg.cipherSuites) {
@@ -164,7 +164,6 @@ func processClientHelloMsg(ctx context.Context, remoteAddr string, conn *Conn, s
 			(config.ShortIds[conn.ClientShortId]) {
 			conn.conn = sourceConn
 		}
-		cHelloMsg.keyShares[0].group = CurveID(i)
 		break
 	}
 	return cHelloMsg, err
@@ -186,6 +185,7 @@ var (
 	targetResponseCache = cache.New(5*time.Minute, 10*time.Minute)
 	ErrorCacheNotFound  = errors.New("cache not found")
 	dest                latestServerName
+	cacheLockMap        = make(map[string]*sync.Mutex)
 )
 
 func serverHelloInCache(chm *clientHelloMsg) (*serverHelloMsg, bool) {
@@ -247,6 +247,22 @@ func targetResponseInCache(chm *clientHelloMsg) (*serverHelloMsg, *certificateMs
 	return serverHello, certMsg, certStatusMsg, nil
 }
 
+func setCacheForClientHello(chm *clientHelloMsg, config *Config, shm *serverHelloMsg, cm *certificateMsg, csm *certificateStatusMsg) {
+	if config.CacheDuration <= 0 {
+		return
+	}
+	lock, ok := cacheLockMap[serverHelloCacheKey.Key(chm.serverName)]
+	if !ok {
+		lock = &sync.Mutex{}
+		cacheLockMap[serverHelloCacheKey.Key(chm.serverName)] = lock
+	}
+	lock.Lock()
+	defer lock.Unlock()
+	targetResponseCache.Set(serverHelloCacheKey.Key(chm.serverName), shm, config.CacheDuration)
+	targetResponseCache.Set(certCacheKey.Key(chm.serverName), cm, config.CacheDuration)
+	targetResponseCache.Set(certStatusCacheKey.Key(chm.serverName), csm, config.CacheDuration)
+}
+
 func processTargetConnWithCache(ctx context.Context, config *Config, msg *clientHelloMsg) (*serverHelloMsg, *certificateMsg, *certificateStatusMsg, error) {
 	serverHello, certMsg, certStatusMsg, err := targetResponseInCache(msg)
 	if err == nil {
@@ -257,11 +273,7 @@ func processTargetConnWithCache(ctx context.Context, config *Config, msg *client
 		return nil, nil, nil, err
 	}
 	go dest.SetLatestServerName(msg.serverName)
-	if config.CacheDuration != 0 {
-		targetResponseCache.Set(serverHelloCacheKey.Key(msg.serverName), serverHello, config.CacheDuration)
-		targetResponseCache.Set(certCacheKey.Key(msg.serverName), certMsg, config.CacheDuration)
-		targetResponseCache.Set(certStatusCacheKey.Key(msg.serverName), certStatusMsg, config.CacheDuration)
-	}
+	go setCacheForClientHello(msg, config, serverHello, certMsg, certStatusMsg)
 	return serverHello, certMsg, certStatusMsg, nil
 }
 
@@ -502,6 +514,9 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 
 	clientHelloMsg, err := processClientHelloMsg(ctx, remoteAddr, c, conn, config)
 	if err != nil {
+		if config.Show {
+			fmt.Printf("REALITY remoteAddr: %v\terror: %v\n", remoteAddr, err)
+		}
 		return nil, serverFailHandler(ctx, underlying, config, clientHelloMsg)
 	}
 
