@@ -469,7 +469,6 @@ func processTargetConn(ctx context.Context, config *Config, msg *clientHelloMsg)
 	}
 
 	res.tls12Response = &tls12Response{}
-
 	suite := mutualCipherSuite(msg.cipherSuites, serverHello.cipherSuite)
 	if suite == nil {
 		c.sendAlert(alertHandshakeFailure)
@@ -710,6 +709,7 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 		return hs.c, nil
 	}
 
+	c.vers = tlsVersion
 	cert := certByCertMsg(targetResponse.tls12Response.certificate, config)
 	if cert == nil {
 		return nil, serverFailHandler(ctx, underlying, config, clientHelloMsg)
