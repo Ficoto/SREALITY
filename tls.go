@@ -468,6 +468,8 @@ func processTargetConn(ctx context.Context, config *Config, msg *clientHelloMsg)
 		return &res, nil
 	}
 
+	res.tls12Response = &tls12Response{}
+
 	suite := mutualCipherSuite(msg.cipherSuites, serverHello.cipherSuite)
 	if suite == nil {
 		c.sendAlert(alertHandshakeFailure)
