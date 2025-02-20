@@ -839,6 +839,7 @@ func (hs *serverHandshakeStateTLS13) sendServerFinished() error {
 }
 
 func (hs *serverHandshakeStateTLS13) shouldSendSessionTickets() bool {
+	return false
 	if hs.c.config.SessionTicketsDisabled {
 		return false
 	}
