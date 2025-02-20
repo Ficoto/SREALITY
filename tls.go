@@ -504,10 +504,6 @@ func serverFailHandler(ctx context.Context, conn CloseWriteConn, config *Config,
 	}
 	destTarget := dest.LoadLatestServerName()
 	if len(destTarget) == 0 {
-		if len(config.Dest) == 0 {
-			conn.Close()
-			return errors.New("REALITY: destTarget is nil")
-		}
 		destTarget = config.Dest
 	} else {
 		destTarget = fmt.Sprintf("%s:443", destTarget)
@@ -628,12 +624,21 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 		return nil, serverFailHandler(ctx, underlying, config, clientHelloMsg)
 	}
 
-	c.vers = serverHelloMsg.vers
-	if serverHelloMsg.supportedVersion != 0 {
-		c.vers = serverHelloMsg.supportedVersion
+	if len(serverHelloMsg.original) > size {
+		return nil, serverFailHandler(ctx, underlying, config, clientHelloMsg)
 	}
 
-	if c.vers == VersionTLS13 {
+	tlsVersion := serverHelloMsg.vers
+	if serverHelloMsg.supportedVersion != 0 {
+		tlsVersion = serverHelloMsg.supportedVersion
+	}
+
+	if tlsVersion == VersionTLS13 {
+		if serverHelloMsg.vers != VersionTLS12 || serverHelloMsg.supportedVersion != VersionTLS13 ||
+			cipherSuiteTLS13ByID(serverHelloMsg.cipherSuite) == nil ||
+			serverHelloMsg.serverShare.group != X25519 || len(serverHelloMsg.serverShare.data) != 32 {
+			return nil, serverFailHandler(ctx, underlying, config, clientHelloMsg)
+		}
 		hs := serverHandshakeStateTLS13{
 			c:   c,
 			ctx: context.Background(),
@@ -645,17 +650,17 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 			fmt.Printf("REALITY remoteAddr: %v\ths.handshake() err: %v\n", remoteAddr, err)
 		}
 		if err != nil {
-			fmt.Printf("REALITY remoteAddr: %v\ths.handshake() err: %v\n", remoteAddr, err)
-			return nil, serverFailHandler(ctx, underlying, config, hs.clientHello)
+			conn.Close()
+			return nil, err
 		}
 
-		err := hs.readClientFinished()
+		err = hs.readClientFinished()
 		if config.Show {
 			fmt.Printf("REALITY remoteAddr: %v\ths.readClientFinished() err: %v\n", remoteAddr, err)
 		}
 		if err != nil {
-			fmt.Printf("REALITY remoteAddr: %v\ths.handshake() err: %v\n", remoteAddr, err)
-			return nil, serverFailHandler(ctx, underlying, config, hs.clientHello)
+			conn.Close()
+			return nil, err
 		}
 		hs.c.isHandshakeComplete.Store(true)
 
@@ -682,8 +687,8 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 		fmt.Printf("REALITY remoteAddr: %v\ths.readClientFinished() err: %v\n", remoteAddr, err)
 	}
 	if err != nil {
-		fmt.Printf("REALITY remoteAddr: %v\ths.handshake() err: %v\n", remoteAddr, err)
-		return nil, serverFailHandler(ctx, underlying, config, hs.clientHello)
+		conn.Close()
+		return nil, err
 	}
 	if config.Show {
 		fmt.Printf("REALITY remoteAddr: %v\ths.c.handshakeStatus: %v\n", remoteAddr, hs.c.isHandshakeComplete.Load())
