@@ -186,7 +186,7 @@ var (
 	targetResponseCache = cache.New(5*time.Minute, 10*time.Minute)
 	ErrorCacheNotFound  = errors.New("cache not found")
 	dest                latestServerName
-	cacheLockMap        = make(map[string]*sync.Mutex)
+	cacheLockMap        = sync.Map{}
 )
 
 type tls12Response struct {
@@ -229,11 +229,12 @@ func setCacheForClientHello(chm *clientHelloMsg, config *Config, targetResponse 
 	if config.CacheDuration <= 0 {
 		return
 	}
-	lock, ok := cacheLockMap[targetResponseCacheKey.Key(chm.serverName, chmMD5)]
+	lAny, ok := cacheLockMap.Load(targetResponseCacheKey.Key(chm.serverName, chmMD5))
 	if !ok {
-		lock = &sync.Mutex{}
-		cacheLockMap[targetResponseCacheKey.Key(chm.serverName, chmMD5)] = lock
+		lAny = &sync.Mutex{}
+		cacheLockMap.Store(targetResponseCacheKey.Key(chm.serverName, chmMD5), lAny)
 	}
+	lock, _ := lAny.(*sync.Mutex)
 	lock.Lock()
 	defer lock.Unlock()
 	targetResponseCache.Set(targetResponseCacheKey.Key(chm.serverName, chmMD5), targetResponse, config.CacheDuration)
