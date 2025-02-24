@@ -19,15 +19,18 @@ import (
 	"crypto/cipher"
 	"crypto/ecdsa"
 	"crypto/ed25519"
+	"crypto/md5"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/pem"
 	"errors"
 	"fmt"
 	"github.com/patrickmn/go-cache"
+	"golang.org/x/crypto/cryptobyte"
 	"io"
 	"net"
 	"os"
@@ -118,18 +121,18 @@ func (lsn *latestServerName) LoadLatestServerName() string {
 
 func processClientHelloMsg(ctx context.Context, remoteAddr string, conn *Conn, sourceConn net.Conn, config *Config) (*clientHelloMsg, error) {
 	cHelloMsg, err := conn.readClientHello(ctx)
-	if err != nil || conn.vers != VersionTLS13 || !config.isInServerNames(cHelloMsg.serverName) {
+	if err != nil || !config.isInServerNames(cHelloMsg.serverName) {
 		return cHelloMsg, InvalidClientHelloError
 	}
-	for i, keyShare := range cHelloMsg.keyShares {
+	for _, keyShare := range cHelloMsg.keyShares {
 		if keyShare.group != X25519 || len(keyShare.data) != 32 {
 			continue
 		}
 		if conn.AuthKey, err = curve25519.X25519(config.PrivateKey, keyShare.data); err != nil {
-			return nil, err
+			return cHelloMsg, err
 		}
 		if _, err = hkdf.New(sha256.New, conn.AuthKey, cHelloMsg.random[:20], []byte("REALITY")).Read(conn.AuthKey); err != nil {
-			return nil, err
+			return cHelloMsg, err
 		}
 		var aead cipher.AEAD
 		if aesgcmPreferred(cHelloMsg.cipherSuites) {
@@ -164,7 +167,6 @@ func processClientHelloMsg(ctx context.Context, remoteAddr string, conn *Conn, s
 			(config.ShortIds[conn.ClientShortId]) {
 			conn.conn = sourceConn
 		}
-		cHelloMsg.keyShares[0].group = CurveID(i)
 		break
 	}
 	return cHelloMsg, err
@@ -172,108 +174,180 @@ func processClientHelloMsg(ctx context.Context, remoteAddr string, conn *Conn, s
 
 type cacheKey string
 
-func (ck cacheKey) Key(serverName string) string {
-	return fmt.Sprintf(string(ck), serverName)
+func (ck cacheKey) Key(serverName string, clientHelloMsgMD5 string) string {
+	return fmt.Sprintf(string(ck), serverName, clientHelloMsgMD5)
 }
 
 const (
-	serverHelloCacheKey cacheKey = "%s:server_hello"
-	certCacheKey        cacheKey = "%s:cert"
-	certStatusCacheKey  cacheKey = "%s:cert_status"
+	targetResponseCacheKey cacheKey = "%s:%s"
 )
 
 var (
 	targetResponseCache = cache.New(5*time.Minute, 10*time.Minute)
-	targetConnLock      = new(sync.Mutex)
 	ErrorCacheNotFound  = errors.New("cache not found")
 	dest                latestServerName
+	cacheLockMap        = sync.Map{}
 )
 
-func serverHelloInCache(chm *clientHelloMsg) (*serverHelloMsg, bool) {
-	msg, ok := targetResponseCache.Get(serverHelloCacheKey.Key(chm.serverName))
-	if !ok {
-		return nil, false
-	}
-	shm, ok := msg.(*serverHelloMsg)
-	if !ok {
-		return nil, false
-	}
-	res := *shm
-	res.original = nil
-	if len(res.sessionId) != 0 {
-		res.sessionId = chm.sessionId
-	}
-	res.random = make([]byte, 32)
-	rand.Read(res.random)
-	return &res, ok
+type tls12Response struct {
+	certificate       *certificateMsg
+	certificateStatus *certificateStatusMsg
 }
 
-func certMsgInCache(chm *clientHelloMsg) (*certificateMsg, bool) {
-	msg, ok := targetResponseCache.Get(certCacheKey.Key(chm.serverName))
-	if !ok {
-		return nil, false
-	}
-	certMsg, ok := msg.(*certificateMsg)
-	return certMsg, ok
+type tls13Response struct {
+	handshakeLen [7]int
 }
 
-func certStatusInCache(chm *clientHelloMsg) (*certificateStatusMsg, bool) {
-	msg, ok := targetResponseCache.Get(certStatusCacheKey.Key(chm.serverName))
-	if !ok {
-		return nil, false
-	}
-	certStatusMsg, ok := msg.(*certificateStatusMsg)
-	return certStatusMsg, ok
+type targetResponse struct {
+	ServerHelloMsg *serverHelloMsg
+	tls12Response  *tls12Response
+	tls13Response  *tls13Response
 }
 
-func targetResponseInCache(chm *clientHelloMsg) (*serverHelloMsg, *certificateMsg, *certificateStatusMsg, error) {
-	serverHello, ok := serverHelloInCache(chm)
+func targetResponseInCache(chm *clientHelloMsg, chmMD5 string) (*targetResponse, error) {
+	response, ok := targetResponseCache.Get(targetResponseCacheKey.Key(chm.serverName, chmMD5))
 	if !ok {
-		return nil, nil, nil, ErrorCacheNotFound
+		return nil, ErrorCacheNotFound
 	}
-	if serverHello.vers == VersionTLS13 || serverHello.supportedVersion == VersionTLS13 {
-		return serverHello, nil, nil, nil
-	}
-	certMsg, ok := certMsgInCache(chm)
+	cacheResponse, ok := response.(*targetResponse)
 	if !ok {
-		return nil, nil, nil, ErrorCacheNotFound
+		return nil, ErrorCacheNotFound
 	}
-	if !serverHello.ocspStapling {
-		return serverHello, certMsg, nil, nil
+	resCopy := *cacheResponse
+	shm := *cacheResponse.ServerHelloMsg
+	shm.original = nil
+	if len(shm.sessionId) != 0 {
+		shm.sessionId = chm.sessionId
 	}
-	certStatusMsg, ok := certStatusInCache(chm)
-	if !ok {
-		return nil, nil, nil, ErrorCacheNotFound
-	}
-	return serverHello, certMsg, certStatusMsg, nil
+	shm.random = make([]byte, 32)
+	rand.Read(shm.random)
+	resCopy.ServerHelloMsg = &shm
+	return &resCopy, nil
 }
 
-func processTargetConnWithCache(ctx context.Context, config *Config, msg *clientHelloMsg) (*serverHelloMsg, *certificateMsg, *certificateStatusMsg, error) {
-	serverHello, certMsg, certStatusMsg, err := targetResponseInCache(msg)
+func setCacheForClientHello(chm *clientHelloMsg, config *Config, targetResponse *targetResponse, chmMD5 string) {
+	if config.CacheDuration <= 0 {
+		return
+	}
+	lAny, ok := cacheLockMap.Load(targetResponseCacheKey.Key(chm.serverName, chmMD5))
+	if !ok {
+		lAny = &sync.Mutex{}
+		cacheLockMap.Store(targetResponseCacheKey.Key(chm.serverName, chmMD5), lAny)
+	}
+	lock, _ := lAny.(*sync.Mutex)
+	lock.Lock()
+	defer lock.Unlock()
+	targetResponseCache.Set(targetResponseCacheKey.Key(chm.serverName, chmMD5), targetResponse, config.CacheDuration)
+}
+
+func isGREASEUint16(v uint16) bool {
+	// First byte is same as second byte
+	// and lowest nibble is 0xa
+	return ((v >> 8) == v&0xff) && v&0xf == 0xa
+}
+
+func clientHelloMsgMD5(msg *clientHelloMsg) string {
+	var b cryptobyte.Builder
+	for _, cs := range msg.cipherSuites {
+		if isGREASEUint16(cs) {
+			continue
+		}
+		b.AddUint16(cs)
+	}
+	var exts cryptobyte.Builder
+	if len(msg.serverName) > 0 {
+		exts.AddUint16(extensionServerName)
+	}
+	if len(msg.supportedPoints) > 0 {
+		exts.AddUint16(extensionSupportedPoints)
+	}
+	if msg.ticketSupported {
+		exts.AddUint16(extensionSessionTicket)
+	}
+	if msg.secureRenegotiationSupported {
+		exts.AddUint16(extensionRenegotiationInfo)
+	}
+	if msg.extendedMasterSecret {
+		exts.AddUint16(extensionExtendedMasterSecret)
+	}
+	if msg.scts {
+		exts.AddUint16(extensionSCT)
+	}
+	if msg.earlyData {
+		exts.AddUint16(extensionEarlyData)
+	}
+	if msg.quicTransportParameters != nil {
+		exts.AddUint16(extensionQUICTransportParameters)
+	}
+	if len(msg.encryptedClientHello) > 0 {
+		exts.AddUint16(extensionEncryptedClientHello)
+	}
+	if msg.ocspStapling {
+		exts.AddUint16(extensionStatusRequest)
+	}
+	if len(msg.supportedCurves) > 0 {
+		exts.AddUint16(extensionSupportedCurves)
+	}
+	if len(msg.supportedSignatureAlgorithms) > 0 {
+		exts.AddUint16(extensionSignatureAlgorithms)
+	}
+	if len(msg.supportedSignatureAlgorithmsCert) > 0 {
+		exts.AddUint16(extensionSignatureAlgorithmsCert)
+	}
+	if len(msg.alpnProtocols) > 0 {
+		exts.AddUint16(extensionALPN)
+	}
+	if len(msg.supportedVersions) > 0 {
+		exts.AddUint16(extensionSupportedVersions)
+	}
+	if len(msg.cookie) > 0 {
+		exts.AddUint16(extensionCookie)
+	}
+	if len(msg.keyShares) > 0 {
+		exts.AddUint16(extensionKeyShare)
+	}
+	if len(msg.pskModes) > 0 {
+		exts.AddUint16(extensionPSKModes)
+	}
+	if len(msg.pskIdentities) > 0 {
+		exts.AddUint16(extensionPreSharedKey)
+	}
+	extBytes, _ := exts.Bytes()
+	b.AddUint8LengthPrefixed(func(b *cryptobyte.Builder) {
+		b.AddBytes(msg.compressionMethods)
+	})
+	if len(extBytes) > 0 {
+		b.AddUint16LengthPrefixed(func(b *cryptobyte.Builder) {
+			b.AddBytes(extBytes)
+		})
+	}
+	clientHelloBytes, _ := b.Bytes()
+	hash := md5.Sum(clientHelloBytes)
+	return hex.EncodeToString(hash[:])
+}
+
+func processTargetConnWithCache(ctx context.Context, config *Config, msg *clientHelloMsg) (*targetResponse, error) {
+	if config.CacheDuration == 0 {
+		return processTargetConn(ctx, config, msg)
+	}
+	chmMD5 := clientHelloMsgMD5(msg)
+	res, err := targetResponseInCache(msg, chmMD5)
 	if err == nil {
-		return serverHello, certMsg, certStatusMsg, nil
+		return res, nil
 	}
-	targetConnLock.Lock()
-	defer targetConnLock.Unlock()
-	serverHello, certMsg, certStatusMsg, err = targetResponseInCache(msg)
-	if err == nil {
-		return serverHello, certMsg, certStatusMsg, nil
-	}
-	serverHello, certMsg, certStatusMsg, err = processTargetConn(ctx, config, msg)
+	res, err = processTargetConn(ctx, config, msg)
 	if err != nil {
-		return nil, nil, nil, err
+		return res, err
 	}
 	go dest.SetLatestServerName(msg.serverName)
-	targetResponseCache.Set(serverHelloCacheKey.Key(msg.serverName), serverHello, config.CacheDuration)
-	targetResponseCache.Set(certCacheKey.Key(msg.serverName), certMsg, config.CacheDuration)
-	targetResponseCache.Set(certStatusCacheKey.Key(msg.serverName), certStatusMsg, config.CacheDuration)
-	return serverHello, certMsg, certStatusMsg, nil
+	go setCacheForClientHello(msg, config, res, chmMD5)
+	return res, nil
 }
 
-func processTargetConn(ctx context.Context, config *Config, msg *clientHelloMsg) (*serverHelloMsg, *certificateMsg, *certificateStatusMsg, error) {
+func processTargetConn(ctx context.Context, config *Config, msg *clientHelloMsg) (*targetResponse, error) {
 	targetConn, err := config.DialContext(ctx, config.Type, fmt.Sprintf("%s:443", msg.serverName))
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, err
 	}
 	c := &Conn{
 		conn:     targetConn,
@@ -283,22 +357,22 @@ func processTargetConn(ctx context.Context, config *Config, msg *clientHelloMsg)
 	defer c.Close()
 	if _, err := c.writeHandshakeRecord(msg, nil); err != nil {
 		c.sendAlert(alertUnexpectedMessage)
-		return nil, nil, nil, err
+		return nil, err
 	}
 
 	msgAny, err := c.readHandshake(nil)
 	if err != nil {
 		c.sendAlert(alertUnexpectedMessage)
-		return nil, nil, nil, err
+		return nil, err
 	}
 	serverHello, ok := msgAny.(*serverHelloMsg)
 	if !ok {
 		c.sendAlert(alertUnexpectedMessage)
-		return nil, nil, nil, errors.New("msg is not server hello msg")
+		return nil, errors.New("msg is not server hello msg")
 	}
 
 	if err := c.pickTLSVersion(serverHello); err != nil {
-		return nil, nil, nil, err
+		return nil, err
 	}
 	maxVers := c.config.maxSupportedVersion(roleClient)
 	tls12Downgrade := string(serverHello.random[24:]) == downgradeCanaryTLS12
@@ -306,7 +380,7 @@ func processTargetConn(ctx context.Context, config *Config, msg *clientHelloMsg)
 	if maxVers == VersionTLS13 && c.vers <= VersionTLS12 && (tls12Downgrade || tls11Downgrade) ||
 		maxVers == VersionTLS12 && c.vers <= VersionTLS11 && tls11Downgrade {
 		c.sendAlert(alertIllegalParameter)
-		return nil, nil, nil, errors.New("illegal parameter")
+		return nil, errors.New("illegal parameter")
 	}
 
 	ver := serverHello.vers
@@ -314,42 +388,110 @@ func processTargetConn(ctx context.Context, config *Config, msg *clientHelloMsg)
 		ver = serverHello.supportedVersion
 	}
 
+	var res targetResponse
+	res.ServerHelloMsg = serverHello
+
 	if ver == VersionTLS13 {
-		hs := &clientHandshakeStateTLS13{
-			c:           c,
-			ctx:         ctx,
-			serverHello: serverHello,
-			hello:       msg,
-		}
-		hs.handshake()
-		if cipherSuiteTLS13ByID(serverHello.cipherSuite) == nil ||
+		if serverHello.vers != VersionTLS12 || serverHello.supportedVersion != VersionTLS13 ||
+			cipherSuiteTLS13ByID(serverHello.cipherSuite) == nil ||
 			serverHello.serverShare.group != X25519 || len(serverHello.serverShare.data) != 32 {
-			return nil, nil, nil, errors.New("invalid server hello")
+			c.sendAlert(alertInternalError)
+			return nil, errors.New("invalid server hello")
 		}
-		return serverHello, nil, nil, nil
+		res.tls13Response = &tls13Response{}
+		var (
+			s2cSaved     = c.rawInput.Bytes()
+			handshakeLen = 0
+			isNeedToRead bool
+		)
+		for {
+			if isNeedToRead {
+				var buf = make([]byte, size)
+				n, err := targetConn.Read(buf)
+				if n == 0 {
+					if err != nil {
+						break
+					}
+					break
+				}
+				s2cSaved = append(s2cSaved, buf[:n]...)
+				isNeedToRead = false
+			}
+			for i, _ := range types {
+				if res.tls13Response.handshakeLen[i] != 0 {
+					continue
+				}
+				if i == 0 {
+					continue
+				}
+				if i == 6 && len(s2cSaved) == 0 {
+					break
+				}
+				if handshakeLen == 0 && len(s2cSaved) > recordHeaderLen {
+					if Value(s2cSaved[1:3]...) != VersionTLS12 ||
+						(i == 1 && (recordType(s2cSaved[0]) != recordTypeChangeCipherSpec || s2cSaved[5] != 1)) ||
+						(i > 1 && recordType(s2cSaved[0]) != recordTypeApplicationData) {
+						c.sendAlert(alertInternalError)
+						return nil, errors.New("get cert len fail")
+					}
+					handshakeLen = recordHeaderLen + Value(s2cSaved[3:5]...)
+				}
+				if handshakeLen > size { // too long
+					c.sendAlert(alertInternalError)
+					return nil, errors.New("handshakeLen too long")
+				}
+				if i == 1 && handshakeLen > 0 && handshakeLen != 6 {
+					c.sendAlert(alertInternalError)
+					return nil, errors.New("handshakeLen not right")
+				}
+				if i == 2 && handshakeLen > 512 {
+					res.tls13Response.handshakeLen[i] = handshakeLen
+					break
+				}
+				if i == 6 && handshakeLen > 0 {
+					res.tls13Response.handshakeLen[i] = handshakeLen
+					break
+				}
+				if handshakeLen == 0 || len(s2cSaved) < handshakeLen {
+					isNeedToRead = true
+					break
+				}
+				res.tls13Response.handshakeLen[i] = handshakeLen
+				s2cSaved = s2cSaved[handshakeLen:]
+				handshakeLen = 0
+			}
+			if isNeedToRead {
+				continue
+			}
+			break
+		}
+		c.sendAlert(alertInternalError)
+		return &res, nil
 	}
 
+	res.tls12Response = &tls12Response{}
 	suite := mutualCipherSuite(msg.cipherSuites, serverHello.cipherSuite)
 	if suite == nil {
 		c.sendAlert(alertHandshakeFailure)
-		return nil, nil, nil, errors.New("tls: server chose an unconfigured cipher suite")
+		return nil, errors.New("tls: server chose an unconfigured cipher suite")
 	}
 	fHash := newFinishedHash(c.vers, suite)
 
 	msgAny, err = c.readHandshake(&fHash)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, err
 	}
 
 	certMsg, ok := msgAny.(*certificateMsg)
 	if !ok || len(certMsg.certificates) == 0 {
 		c.sendAlert(alertUnexpectedMessage)
-		return nil, nil, nil, errors.New("unexpected message")
+		return nil, errors.New("unexpected message")
 	}
+	res.tls12Response.certificate = certMsg
 
 	msgAny, err = c.readHandshake(&fHash)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, err
 	}
 
 	certStatusMsg, ok := msgAny.(*certificateStatusMsg)
@@ -360,13 +502,14 @@ func processTargetConn(ctx context.Context, config *Config, msg *clientHelloMsg)
 			// with empty "extension_data" in the extended server hello.
 
 			c.sendAlert(alertUnexpectedMessage)
-			return nil, nil, nil, errors.New("tls: received unexpected CertificateStatus message")
+			return nil, errors.New("tls: received unexpected CertificateStatus message")
 		}
 		msgAny, err = c.readHandshake(&fHash)
 		if err != nil {
-			return nil, nil, nil, err
+			return nil, err
 		}
 	}
+	res.tls12Response.certificateStatus = certStatusMsg
 
 	var shd *serverHelloDoneMsg
 	for {
@@ -381,20 +524,20 @@ func processTargetConn(ctx context.Context, config *Config, msg *clientHelloMsg)
 	}
 	if shd == nil {
 		c.sendAlert(alertUnexpectedMessage)
-		return serverHello, certMsg, certStatusMsg, nil
+		return &res, nil
 	}
 
 	if err := c.writeChangeCipherRecord(); err != nil {
-		return serverHello, certMsg, certStatusMsg, nil
+		return &res, nil
 	}
 	if _, err := c.writeHandshakeRecord(&finishedMsg{}, &fHash); err != nil {
-		return serverHello, certMsg, certStatusMsg, nil
+		return &res, nil
 	}
 	if _, err := c.flush(); err != nil {
-		return serverHello, certMsg, certStatusMsg, nil
+		return &res, nil
 	}
 	c.isHandshakeComplete.Store(true)
-	return serverHello, certMsg, certStatusMsg, nil
+	return &res, nil
 }
 
 func serverFailHandler(ctx context.Context, conn CloseWriteConn, config *Config, msg *clientHelloMsg) error {
@@ -404,10 +547,6 @@ func serverFailHandler(ctx context.Context, conn CloseWriteConn, config *Config,
 	}
 	destTarget := dest.LoadLatestServerName()
 	if len(destTarget) == 0 {
-		if len(config.Dest) == 0 {
-			conn.Close()
-			return errors.New("REALITY: destTarget is nil")
-		}
 		destTarget = config.Dest
 	} else {
 		destTarget = fmt.Sprintf("%s:443", destTarget)
@@ -507,6 +646,9 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 
 	clientHelloMsg, err := processClientHelloMsg(ctx, remoteAddr, c, conn, config)
 	if err != nil {
+		if config.Show {
+			fmt.Printf("REALITY remoteAddr: %v\terror: %v\n", remoteAddr, err)
+		}
 		return nil, serverFailHandler(ctx, underlying, config, clientHelloMsg)
 	}
 
@@ -520,39 +662,44 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 		return nil, serverFailHandler(ctx, underlying, config, clientHelloMsg)
 	}
 
-	serverHelloMsg, certMsg, certStatusMsg, err := processTargetConnWithCache(ctx, config, clientHelloMsg)
+	targetResponse, err := processTargetConnWithCache(ctx, config, clientHelloMsg)
 	if err != nil {
 		return nil, serverFailHandler(ctx, underlying, config, clientHelloMsg)
 	}
 
-	c.vers = serverHelloMsg.vers
-	if serverHelloMsg.supportedVersion != 0 {
-		c.vers = serverHelloMsg.supportedVersion
+	if len(targetResponse.ServerHelloMsg.original) > size {
+		return nil, serverFailHandler(ctx, underlying, config, clientHelloMsg)
 	}
 
-	if c.vers == VersionTLS13 {
+	tlsVersion := targetResponse.ServerHelloMsg.vers
+	if targetResponse.ServerHelloMsg.supportedVersion != 0 {
+		tlsVersion = targetResponse.ServerHelloMsg.supportedVersion
+	}
+
+	if tlsVersion == VersionTLS13 {
 		hs := serverHandshakeStateTLS13{
 			c:   c,
 			ctx: context.Background(),
 		}
 		hs.clientHello = clientHelloMsg
-		hs.hello = serverHelloMsg
+		hs.hello = targetResponse.ServerHelloMsg
+		copy(hs.c.out.handshakeLen[:], targetResponse.tls13Response.handshakeLen[:])
 		err = hs.handshake()
 		if config.Show {
 			fmt.Printf("REALITY remoteAddr: %v\ths.handshake() err: %v\n", remoteAddr, err)
 		}
 		if err != nil {
-			fmt.Printf("REALITY remoteAddr: %v\ths.handshake() err: %v\n", remoteAddr, err)
-			return nil, serverFailHandler(ctx, underlying, config, hs.clientHello)
+			conn.Close()
+			return nil, err
 		}
 
-		err := hs.readClientFinished()
+		err = hs.readClientFinished()
 		if config.Show {
 			fmt.Printf("REALITY remoteAddr: %v\ths.readClientFinished() err: %v\n", remoteAddr, err)
 		}
 		if err != nil {
-			fmt.Printf("REALITY remoteAddr: %v\ths.handshake() err: %v\n", remoteAddr, err)
-			return nil, serverFailHandler(ctx, underlying, config, hs.clientHello)
+			conn.Close()
+			return nil, err
 		}
 		hs.c.isHandshakeComplete.Store(true)
 
@@ -563,7 +710,8 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 		return hs.c, nil
 	}
 
-	cert := certByCertMsg(certMsg, config)
+	c.vers = tlsVersion
+	cert := certByCertMsg(targetResponse.tls12Response.certificate, config)
 	if cert == nil {
 		return nil, serverFailHandler(ctx, underlying, config, clientHelloMsg)
 	}
@@ -573,14 +721,14 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 		cert: cert,
 	}
 	hs.clientHello = clientHelloMsg
-	hs.hello = serverHelloMsg
-	err = hs.handshake(certMsg, certStatusMsg)
+	hs.hello = targetResponse.ServerHelloMsg
+	err = hs.handshake(targetResponse.tls12Response.certificate, targetResponse.tls12Response.certificateStatus)
 	if config.Show {
 		fmt.Printf("REALITY remoteAddr: %v\ths.readClientFinished() err: %v\n", remoteAddr, err)
 	}
 	if err != nil {
-		fmt.Printf("REALITY remoteAddr: %v\ths.handshake() err: %v\n", remoteAddr, err)
-		return nil, serverFailHandler(ctx, underlying, config, hs.clientHello)
+		conn.Close()
+		return nil, err
 	}
 	if config.Show {
 		fmt.Printf("REALITY remoteAddr: %v\ths.c.handshakeStatus: %v\n", remoteAddr, hs.c.isHandshakeComplete.Load())
