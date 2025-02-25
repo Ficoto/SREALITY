@@ -684,6 +684,9 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 		hs.clientHello = clientHelloMsg
 		hs.hello = targetResponse.ServerHelloMsg
 		copy(hs.c.out.handshakeLen[:], targetResponse.tls13Response.handshakeLen[:])
+		if hs.c.out.handshakeLen[2] > 512 {
+			hs.c.out.handshakeBuf = make([]byte, 0, size)
+		}
 		err = hs.handshake()
 		if config.Show {
 			fmt.Printf("REALITY remoteAddr: %v\ths.handshake() err: %v\n", remoteAddr, err)
