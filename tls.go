@@ -103,20 +103,22 @@ func Value(vals ...byte) (value int) {
 }
 
 type latestServerName struct {
-	value string
-	lock  sync.RWMutex
+	sni            string
+	isUseFakeSNIIP bool
+	lock           sync.RWMutex
 }
 
-func (lsn *latestServerName) SetLatestServerName(serverName string) {
+func (lsn *latestServerName) SetLatestServerName(serverName string, isUseFakeSNIIP bool) {
 	lsn.lock.Lock()
 	defer lsn.lock.Unlock()
-	lsn.value = serverName
+	lsn.sni = serverName
+	lsn.isUseFakeSNIIP = isUseFakeSNIIP
 }
 
-func (lsn *latestServerName) LoadLatestServerName() string {
+func (lsn *latestServerName) LoadLatestServerName() (string, bool) {
 	lsn.lock.RLock()
 	defer lsn.lock.RUnlock()
-	return lsn.value
+	return lsn.sni, lsn.isUseFakeSNIIP
 }
 
 func processClientHelloMsg(ctx context.Context, remoteAddr string, conn *Conn, sourceConn net.Conn, config *Config) (*clientHelloMsg, error) {
@@ -328,26 +330,36 @@ func clientHelloMsgMD5(msg *clientHelloMsg) string {
 
 func processTargetConnWithCache(ctx context.Context, config *Config, msg *clientHelloMsg) (*targetResponse, error) {
 	if config.CacheDuration == 0 {
-		return processTargetConn(ctx, config, msg)
+		response, _, err := processTargetConn(ctx, config, msg)
+		return response, err
 	}
 	chmMD5 := clientHelloMsgMD5(msg)
 	res, err := targetResponseInCache(msg, chmMD5)
 	if err == nil {
 		return res, nil
 	}
-	res, err = processTargetConn(ctx, config, msg)
+	var isUseFakeSNIIP bool
+	res, isUseFakeSNIIP, err = processTargetConn(ctx, config, msg)
 	if err != nil {
 		return res, err
 	}
-	go dest.SetLatestServerName(msg.serverName)
+	go dest.SetLatestServerName(msg.serverName, isUseFakeSNIIP)
 	go setCacheForClientHello(msg, config, res, chmMD5)
 	return res, nil
 }
 
-func processTargetConn(ctx context.Context, config *Config, msg *clientHelloMsg) (*targetResponse, error) {
+func processTargetConn(ctx context.Context, config *Config, msg *clientHelloMsg) (*targetResponse, bool, error) {
+	var isUseFakeSNIIP bool
 	targetConn, err := config.DialContext(ctx, config.Type, fmt.Sprintf("%s:443", msg.serverName))
 	if err != nil {
-		return nil, err
+		if len(config.FakeSNIIP) == 0 {
+			return nil, isUseFakeSNIIP, err
+		}
+		targetConn, err = config.DialContext(ctx, config.Type, fmt.Sprintf("%s:443", config.FakeSNIIP))
+		if err != nil {
+			return nil, isUseFakeSNIIP, err
+		}
+		isUseFakeSNIIP = true
 	}
 	c := &Conn{
 		conn:     targetConn,
@@ -357,22 +369,22 @@ func processTargetConn(ctx context.Context, config *Config, msg *clientHelloMsg)
 	defer c.Close()
 	if _, err := c.writeHandshakeRecord(msg, nil); err != nil {
 		c.sendAlert(alertUnexpectedMessage)
-		return nil, err
+		return nil, isUseFakeSNIIP, err
 	}
 
 	msgAny, err := c.readHandshake(nil)
 	if err != nil {
 		c.sendAlert(alertUnexpectedMessage)
-		return nil, err
+		return nil, isUseFakeSNIIP, err
 	}
 	serverHello, ok := msgAny.(*serverHelloMsg)
 	if !ok {
 		c.sendAlert(alertUnexpectedMessage)
-		return nil, errors.New("msg is not server hello msg")
+		return nil, isUseFakeSNIIP, errors.New("msg is not server hello msg")
 	}
 
 	if err := c.pickTLSVersion(serverHello); err != nil {
-		return nil, err
+		return nil, isUseFakeSNIIP, err
 	}
 	maxVers := c.config.maxSupportedVersion(roleClient)
 	tls12Downgrade := string(serverHello.random[24:]) == downgradeCanaryTLS12
@@ -380,7 +392,7 @@ func processTargetConn(ctx context.Context, config *Config, msg *clientHelloMsg)
 	if maxVers == VersionTLS13 && c.vers <= VersionTLS12 && (tls12Downgrade || tls11Downgrade) ||
 		maxVers == VersionTLS12 && c.vers <= VersionTLS11 && tls11Downgrade {
 		c.sendAlert(alertIllegalParameter)
-		return nil, errors.New("illegal parameter")
+		return nil, isUseFakeSNIIP, errors.New("illegal parameter")
 	}
 
 	ver := serverHello.vers
@@ -396,7 +408,7 @@ func processTargetConn(ctx context.Context, config *Config, msg *clientHelloMsg)
 			cipherSuiteTLS13ByID(serverHello.cipherSuite) == nil ||
 			serverHello.serverShare.group != X25519 || len(serverHello.serverShare.data) != 32 {
 			c.sendAlert(alertInternalError)
-			return nil, errors.New("invalid server hello")
+			return nil, isUseFakeSNIIP, errors.New("invalid server hello")
 		}
 		res.tls13Response = &tls13Response{}
 		var (
@@ -432,17 +444,17 @@ func processTargetConn(ctx context.Context, config *Config, msg *clientHelloMsg)
 						(i == 1 && (recordType(s2cSaved[0]) != recordTypeChangeCipherSpec || s2cSaved[5] != 1)) ||
 						(i > 1 && recordType(s2cSaved[0]) != recordTypeApplicationData) {
 						c.sendAlert(alertInternalError)
-						return nil, errors.New("get cert len fail")
+						return nil, isUseFakeSNIIP, errors.New("get cert len fail")
 					}
 					handshakeLen = recordHeaderLen + Value(s2cSaved[3:5]...)
 				}
 				if handshakeLen > size { // too long
 					c.sendAlert(alertInternalError)
-					return nil, errors.New("handshakeLen too long")
+					return nil, isUseFakeSNIIP, errors.New("handshakeLen too long")
 				}
 				if i == 1 && handshakeLen > 0 && handshakeLen != 6 {
 					c.sendAlert(alertInternalError)
-					return nil, errors.New("handshakeLen not right")
+					return nil, isUseFakeSNIIP, errors.New("handshakeLen not right")
 				}
 				if i == 2 && handshakeLen > 512 {
 					res.tls13Response.handshakeLen[i] = handshakeLen
@@ -466,32 +478,32 @@ func processTargetConn(ctx context.Context, config *Config, msg *clientHelloMsg)
 			break
 		}
 		c.sendAlert(alertInternalError)
-		return &res, nil
+		return &res, isUseFakeSNIIP, nil
 	}
 
 	res.tls12Response = &tls12Response{}
 	suite := mutualCipherSuite(msg.cipherSuites, serverHello.cipherSuite)
 	if suite == nil {
 		c.sendAlert(alertHandshakeFailure)
-		return nil, errors.New("tls: server chose an unconfigured cipher suite")
+		return nil, isUseFakeSNIIP, errors.New("tls: server chose an unconfigured cipher suite")
 	}
 	fHash := newFinishedHash(c.vers, suite)
 
 	msgAny, err = c.readHandshake(&fHash)
 	if err != nil {
-		return nil, err
+		return nil, isUseFakeSNIIP, err
 	}
 
 	certMsg, ok := msgAny.(*certificateMsg)
 	if !ok || len(certMsg.certificates) == 0 {
 		c.sendAlert(alertUnexpectedMessage)
-		return nil, errors.New("unexpected message")
+		return nil, isUseFakeSNIIP, errors.New("unexpected message")
 	}
 	res.tls12Response.certificate = certMsg
 
 	msgAny, err = c.readHandshake(&fHash)
 	if err != nil {
-		return nil, err
+		return nil, isUseFakeSNIIP, err
 	}
 
 	certStatusMsg, ok := msgAny.(*certificateStatusMsg)
@@ -502,11 +514,11 @@ func processTargetConn(ctx context.Context, config *Config, msg *clientHelloMsg)
 			// with empty "extension_data" in the extended server hello.
 
 			c.sendAlert(alertUnexpectedMessage)
-			return nil, errors.New("tls: received unexpected CertificateStatus message")
+			return nil, isUseFakeSNIIP, errors.New("tls: received unexpected CertificateStatus message")
 		}
 		msgAny, err = c.readHandshake(&fHash)
 		if err != nil {
-			return nil, err
+			return nil, isUseFakeSNIIP, err
 		}
 	}
 	res.tls12Response.certificateStatus = certStatusMsg
@@ -524,20 +536,20 @@ func processTargetConn(ctx context.Context, config *Config, msg *clientHelloMsg)
 	}
 	if shd == nil {
 		c.sendAlert(alertUnexpectedMessage)
-		return &res, nil
+		return &res, isUseFakeSNIIP, nil
 	}
 
 	if err := c.writeChangeCipherRecord(); err != nil {
-		return &res, nil
+		return &res, isUseFakeSNIIP, nil
 	}
 	if _, err := c.writeHandshakeRecord(&finishedMsg{}, &fHash); err != nil {
-		return &res, nil
+		return &res, isUseFakeSNIIP, nil
 	}
 	if _, err := c.flush(); err != nil {
-		return &res, nil
+		return &res, isUseFakeSNIIP, nil
 	}
 	c.isHandshakeComplete.Store(true)
-	return &res, nil
+	return &res, isUseFakeSNIIP, nil
 }
 
 func serverFailHandler(ctx context.Context, conn CloseWriteConn, config *Config, msg *clientHelloMsg) error {
@@ -545,10 +557,13 @@ func serverFailHandler(ctx context.Context, conn CloseWriteConn, config *Config,
 		conn.Close()
 		return errors.New("REALITY: client hello msg is nil")
 	}
-	destTarget := dest.LoadLatestServerName()
-	if len(destTarget) == 0 {
+	destTarget, isUseFakeSNIIP := dest.LoadLatestServerName()
+	switch {
+	case len(destTarget) == 0:
 		destTarget = config.Dest
-	} else {
+	case isUseFakeSNIIP:
+		destTarget = fmt.Sprintf("%s:443", config.FakeSNIIP)
+	default:
 		destTarget = fmt.Sprintf("%s:443", destTarget)
 	}
 	target, err := config.DialContext(ctx, config.Type, destTarget)
