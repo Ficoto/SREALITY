@@ -554,14 +554,31 @@ func processTargetConn(ctx context.Context, config *Config, msg *clientHelloMsg)
 
 func serverFailHandler(ctx context.Context, conn CloseWriteConn, config *Config, msg *clientHelloMsg) error {
 	if msg == nil {
-		conn.Close()
+		c := Conn{
+			conn:   conn,
+			config: config,
+		}
+		c.sendAlert(alertIllegalParameter)
+		c.Close()
 		return errors.New("REALITY: client hello msg is nil")
+	}
+	if config.Show {
+		fmt.Printf("REALITY remoteAddr: %v\tforwarded SNI: %v\n", conn.RemoteAddr(), msg.serverName)
 	}
 	destTarget, isUseFakeSNIIP := dest.LoadLatestServerName()
 	switch {
 	case len(destTarget) == 0:
 		destTarget = config.Dest
 	case isUseFakeSNIIP:
+		if msg.serverName != destTarget {
+			c := Conn{
+				conn:   conn,
+				config: config,
+			}
+			c.sendAlert(alertUnrecognizedName)
+			c.Close()
+			return errors.New("REALITY: client hello msg fake server name is wrong")
+		}
 		destTarget = fmt.Sprintf("%s:443", config.FakeSNIIP)
 	default:
 		destTarget = fmt.Sprintf("%s:443", destTarget)
