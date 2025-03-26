@@ -805,6 +805,7 @@ type Config struct {
 	RSACert             []byte
 	ECDSACertPrivateKey *ecdsa.PrivateKey
 	ECDSACert           []byte
+	FakeSNIIP           string
 }
 
 const (
